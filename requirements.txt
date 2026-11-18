@@ -1,0 +1,11 @@
+pandas
+numpy
+ccxt
+statsmodels
+matplotlib
+seaborn
+pyyaml
+pyarrow
+jupyter
+pytest
+nbstripout
