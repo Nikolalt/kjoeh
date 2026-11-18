@@ -1,0 +1,55 @@
+# =============================================================================
+# config_ratio.yaml: single source of truth for the alt/BTC ratio strategy
+#                    (notebook 05, loaded with data.load_config("config_ratio.yaml"))
+#
+#   setup:       fixed choices, set once before any analysis
+#   parameters:  decided on TRAIN data only (parameter sweep in backtest.parameter_sweep)
+#                notebook 05 only reads them and decides nothing
+#                Decision (train 2018-2022): every grid cell lost money; 90-day window, entry 2.0,
+#                stop-loss 0.10 is the least-bad cell (90-day row is best throughout, but neighbours
+#                along entry_z are clearly worse, so the choice is fragile). Kept as an honest baseline.
+# =============================================================================
+
+setup:
+  source: yahoo
+  timeframe: 1d
+  numeraire: BTC-USD          # anchor: every alt is priced in BTC
+  alts:                       # 10 liquid alts with full Yahoo history since Nov 2017
+    - ETH-USD
+    - BNB-USD
+    - XRP-USD
+    - ADA-USD
+    - DOGE-USD
+    - LTC-USD
+    - LINK-USD
+    - BCH-USD
+    - XLM-USD
+    - TRX-USD
+  download_start: "2017-11-09" # first day all 10 alts are on Yahoo (used for rolling warm-up)
+  start: "2018-01-01"          # first day of the backtest
+  train_end: "2023-01-01"      # train = [start, train_end), test = [train_end, end)
+  end: "2026-11-01"            # exclusive
+  max_ffill_days: 3           # forward-fill at most this many missing days, longer gaps stay NaN
+  initial_capital: 100000     # USD
+  fee_bps_per_leg: 10         # exchange fee per leg per trade
+  slippage_bps_per_leg: 5     # half-spread + impact per leg per trade
+  borrow_bps_per_day: 3       # cost of holding the short leg (~11%/yr), an explicit assumption
+  execution_lag: 1            # signal at close of day t, filled at close of day t+1
+  sweep_grid:                 # train-only parameter sweep that decided the parameters below
+    zscore_lookback: [20, 30, 60, 90]
+    entry_z: [1.5, 2.0, 2.5]
+    stop_loss: [0.1, 0.2, null]
+  cost_multipliers: [0, 1, 2, 3]  # robustness: fee, slippage and borrow scaled together
+
+parameters:
+  zscore_method: rolling      # rolling (main) or expanding (comparison)
+  zscore_lookback: 90         # days for rolling mean/std of the log ratio (train sweep: 20-30 worst, 90 least bad)
+  entry_z: 2.0                # open when |z| > entry_z (train sweep over 1.5 / 2.0 / 2.5)
+  exit_z: 0.0                 # close when z crosses back through exit_z
+  stop_z: 4.0                 # z-stop: close when |z| > stop_z (ratio breakout)
+  stop_loss: 0.10             # close when the log ratio moved > 0.10 against the trade (~10% of notional; sweep 0.1 / 0.2 / off)
+  take_profit: null           # off: the mean is the profit target
+  time_stop_halflives: 3      # time stop: close after N half-lives (half-life per pair, train only)
+  max_holding_days: 60        # hard cap on holding time, also used when the half-life is undefined
+  sizing: equal_risk          # equal_risk (size ~ 1 / train ratio vol) or equal_capital
+  max_gross_leverage: 2.0     # sum of |alt leg| + |BTC leg| over all pairs when all are open
