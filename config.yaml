@@ -1,0 +1,39 @@
+# =============================================================================
+# config.yaml: single source of truth for the project
+#
+#   setup:       fixed choices, set once before any analysis
+#   parameters:  decided in notebooks 02/03 on TRAIN data only
+#                notebook 04 only reads them and decides nothing
+# =============================================================================
+
+setup:
+  exchange: binance
+  universe:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+    - BNB/USDT
+    - XRP/USDT
+    - ADA/USDT
+    - AVAX/USDT
+    - LINK/USDT
+    - DOT/USDT
+    - LTC/USDT
+    - DOGE/USDT
+    - TRX/USDT
+  timeframe: 1h
+  start: "2023-01-01"
+  train_end: "2025-01-01"     # train = [start, train_end), test = [train_end, end)
+  end: "2026-01-01"
+  fee_per_leg: 0.001          # 10 bps per leg per trade (Binance spot taker)
+  initial_capital: 10000      # USDT
+
+parameters:
+  pair: null                  # e.g. [ETH/USDT, BTC/USDT], set in 02_pair_selection
+  hedge_window: 720           # bars for rolling hedge ratio (placeholder, set in 03)
+  zscore_lookback: 168        # bars for rolling z-score (placeholder, set in 03)
+  entry_z: 2.0                # open when |z| > entry_z
+  exit_z: 0.0                 # close when z crosses back through exit_z
+  stop_z: 3.5                 # z-stop: close when |z| > stop_z
+  time_stop_halflives: 2      # time stop: close after N half-lives in a trade
+  position_size: 1.0          # fraction of capital per trade (placeholder, set in 03)
