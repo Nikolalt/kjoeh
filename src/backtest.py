@@ -25,9 +25,14 @@ constant weights every bar. Trading costs are only charged when the target weigh
 """
 
 from dataclasses import dataclass, field
+from itertools import product
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
+
+from . import strategy
+from .data import split_train_test
 
 HOURS_PER_YEAR = 24 * 365          # crypto trades around the clock, every day of the year
 HOURS_PER_MONTH = HOURS_PER_YEAR / 12
@@ -318,3 +323,121 @@ def compute_metrics(result: Result) -> dict:
         "total_slippage": usdt["slippage"],
         "total_funding": usdt["funding"],
     }
+
+
+# =============================================================================
+# 4. PIPELINE AND PARAMETER SWEEPS
+# =============================================================================
+
+def run_strategy(
+    prices: pd.DataFrame,
+    funding: pd.DataFrame | None,
+    pair: tuple[str, str],
+    params: dict,
+    period: str = "train",
+) -> Result:
+    """Run the full pipeline for one pair: hedge ratio -> spread -> z-score -> signals -> risk -> backtest.
+
+    This is the main entry point of the notebooks (also called repeatedly by `sweep`).
+
+    How the train/test split is respected:
+        - Everything estimated once (static beta, half-life for the time stop) uses TRAIN data only.
+        - Rolling quantities (rolling beta, z-score, rolling cointegration p-value) are computed on
+          the full price history, because at every bar they only look backwards. This gives the
+          test period a proper warm-up from the end of the train period without using future data.
+        - Signals, risk rules and the backtest then run only inside the requested period, starting flat.
+
+    Input:  prices (full history, one column per coin), hourly funding rates (same layout) or None,
+            pair (A, B) = trade A against B, params from data.get_params, period "train" or "test".
+    Output: Result, including spread, z, beta and the two price series for plotting.
+    """
+    if period not in ("train", "test"):
+        raise ValueError("period must be 'train' or 'test'")
+    if period == "test":
+        print("=" * 78)
+        print("WARNING: running on the TEST period. Use this only in notebook 04, once,")
+        print("with parameters already fixed in config.yaml. Never tune parameters on it.")
+        print("=" * 78)
+
+    name_a, name_b = pair
+    a, b = prices[name_a], prices[name_b]
+    train_part, test_part = split_train_test(prices[[name_a, name_b]], params["train_end"])
+    train_index = train_part.index
+    index = train_index if period == "train" else test_part.index   # the bars we trade on
+    train_a, train_b = train_part[name_a], train_part[name_b]
+
+    # 1) hedge ratio and intercept: static (estimated on train only) or rolling (backward-looking)
+    window = params["hedge_window"]
+    if window is None:
+        static_beta = strategy.hedge_ratio(train_a, train_b)
+        alpha = strategy.hedge_intercept(train_a, train_b, static_beta)
+        beta = pd.Series(static_beta, index=prices.index, name="beta")
+    else:
+        beta = strategy.hedge_ratio(a, b, window)
+        alpha = strategy.hedge_intercept(a, b, beta, window)
+
+    # 2) spread and z-score on the full history (both only use past data at every bar)
+    spread = strategy.compute_spread(a, b, beta, alpha)
+    z = strategy.zscore(spread, params["zscore_lookback"])
+
+    # 3) half-life of the traded spread, estimated on train only (used by the time stop)
+    half_life = strategy.half_life(spread.loc[train_index])
+
+    # 4) optional rolling cointegration p-values for the entry filter
+    coint_pvalues = None
+    if params.get("use_coint_filter", False):
+        coint_pvalues = strategy.rolling_coint_pvalues(a, b, params["coint_window"], params["coint_step"])
+
+    # 5) restrict to the requested period, then signals -> risk rules -> positions
+    z_period = z.loc[index]
+    signals = strategy.generate_signals(z_period, params["entry_z"], params["exit_z"])
+    positions, exit_reasons = strategy.apply_risk(signals, z_period, half_life, params, coint_pvalues)
+
+    # 6) backtest with costs and (optionally) funding
+    use_funding = params.get("use_funding", True) and funding is not None
+    result = run_backtest(
+        a.loc[index], b.loc[index], beta.loc[index], positions,
+        fee_per_leg=params["fee_per_leg"],
+        slippage_per_leg=params["slippage_per_leg"],
+        funding_a=funding[name_a].loc[index] if use_funding else None,
+        funding_b=funding[name_b].loc[index] if use_funding else None,
+        initial_capital=params["initial_capital"],
+        exit_reasons=exit_reasons,
+        z=z_period,
+        params=dict(params, pair=tuple(pair), period=period, half_life=half_life),
+    )
+    result.spread = spread.loc[index]
+    result.beta = beta.loc[index]
+    result.prices = pd.DataFrame({name_a: a.loc[index], name_b: b.loc[index]})
+    return result
+
+
+SWEEP_METRICS = ["sharpe", "total_return", "annual_return", "max_drawdown", "calmar",
+                 "n_trades", "trades_per_month", "win_rate", "avg_holding_hours", "time_in_market"]
+
+
+def sweep(
+    prices: pd.DataFrame,
+    funding: pd.DataFrame | None,
+    pair: tuple[str, str],
+    base_params: dict,
+    grid: dict,
+    period: str = "train",
+) -> pd.DataFrame:
+    """Run run_strategy for every combination of the parameter grid.
+
+    Example: grid = {"entry_z": [1.5, 2.0], "zscore_lookback": [72, 168]} -> 4 runs. Parameters not
+    in the grid keep their value from base_params.
+
+    Input:  prices, funding, pair, base params (from data.get_params), grid as {name: list of values},
+            period (always "train" for calibration).
+    Output: DataFrame, one row per combination: the grid parameters followed by the main metrics.
+    """
+    names = list(grid)
+    combos = list(product(*grid.values()))  # every combination of the grid values
+    rows = []
+    for values in tqdm(combos, desc="sweep"):
+        params = dict(base_params, **dict(zip(names, values)))
+        result = run_strategy(prices, funding, pair, params, period=period)
+        rows.append({**dict(zip(names, values)), **{m: result.metrics[m] for m in SWEEP_METRICS}})
+    return pd.DataFrame(rows)

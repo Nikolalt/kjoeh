@@ -183,12 +183,31 @@ def hedge_ratio(a: pd.Series, b: pd.Series, window: int | None = None) -> float 
     return (log_a.rolling(window).cov(log_b) / log_b.rolling(window).var()).rename("beta")
 
 
+def hedge_intercept(a: pd.Series, b: pd.Series, beta: float | pd.Series, window: int | None = None) -> float | pd.Series:
+    """OLS intercept alpha that belongs to a hedge ratio: alpha = mean(log a) - beta * mean(log b).
+
+    Why this matters for a ROLLING beta: log(BTC) is about 11, so a change of beta by only 0.01
+    shifts log(a) - beta * log(b) by 0.11, i.e. by a jump much larger than normal spread moves.
+    Subtracting the rolling intercept turns the spread into the residual of the rolling regression,
+    which stays centred around zero when beta moves. (Measured on ETH/BTC train data: the half-life
+    drops from ~22,700 h without the intercept to ~200 h with it.)
+
+    Input:  price series a and b, hedge ratio (float or Series), window (None = all input data).
+    Output: float (static) or Series (rolling, same past-only window as hedge_ratio).
+    """
+    log_a, log_b = np.log(a), np.log(b)
+    if window is None:
+        return float(log_a.mean() - beta * log_b.mean())
+    return (log_a.rolling(window).mean() - beta * log_b.rolling(window).mean()).rename("alpha")
+
+
 def compute_spread(a: pd.Series, b: pd.Series, beta: float | pd.Series, alpha: float = 0.0) -> pd.Series:
     """Spread = log(a) - beta * log(b) - alpha.
 
-    alpha only shifts the level; the z-score removes the level anyway, so alpha = 0 is fine there.
+    With a static beta, alpha only shifts the level and the z-score removes it anyway. With a
+    rolling beta, pass the rolling alpha from hedge_intercept (see there why).
 
-    Input:  price series a and b, hedge ratio (float or Series), intercept.
+    Input:  price series a and b, hedge ratio (float or Series), intercept (float or Series).
     Output: spread Series.
     """
     return (np.log(a) - beta * np.log(b) - alpha).rename("spread")

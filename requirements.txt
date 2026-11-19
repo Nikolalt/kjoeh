@@ -5,6 +5,8 @@ statsmodels
 matplotlib
 seaborn
 pyyaml
+ruamel.yaml
+tqdm
 pyarrow
 jupyter
 pytest

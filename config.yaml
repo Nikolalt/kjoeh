@@ -32,11 +32,16 @@ setup:
   initial_capital: 10000      # USDT
 
 parameters:
-  pair: null                  # e.g. [ETH, BTC], set in 02_pair_selection
-  hedge_window: 720           # bars for rolling hedge ratio (placeholder, set in 03)
-  zscore_lookback: 168        # bars for rolling z-score (placeholder, set in 03)
-  entry_z: 2.0                # open when |z| > entry_z
-  exit_z: 0.0                 # close when z crosses back through exit_z
-  stop_z: 3.5                 # z-stop: close when |z| > stop_z
-  time_stop_halflives: 2      # time stop: close after N half-lives in a trade
-  position_size: 1.0          # fraction of capital per trade (placeholder, set in 03)
+  pair: null                  # e.g. [ETH, BTC] = long/short ETH against BTC, set in 02_pair_selection
+  hedge_window: 720           # bars for rolling hedge ratio; null = static beta from train (set in 03a)
+  zscore_lookback: 168        # bars for rolling z-score (placeholder, set in 03b)
+  entry_z: 2.0                # open when |z| > entry_z (set in 03b)
+  exit_z: 0.0                 # close when z is back within exit_z of the mean (set in 03b)
+  stop_z: 3.5                 # z-stop: close when |z| > stop_z; null = off (set in 03c)
+  time_stop_halflives: 2      # time stop: close after N half-lives in a trade; null = off (set in 03c)
+  use_coint_filter: false     # block entries while the rolling cointegration p-value is high (03c)
+  coint_window: 2160          # bars (90 days) for the rolling cointegration test
+  coint_step: 24              # recompute the rolling p-value every 24 bars
+  coint_max_pvalue: 0.2       # entries allowed only while the rolling p-value <= this
+  position_size: 1.0          # fraction of capital per trade, gross across both legs
+  use_funding: true           # include funding payments (false only for the robustness check in 04)

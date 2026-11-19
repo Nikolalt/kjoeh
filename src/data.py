@@ -23,6 +23,8 @@ from pathlib import Path
 import ccxt
 import pandas as pd
 import yaml
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedSeq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
@@ -52,14 +54,71 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def update_config(section: str, values: dict, path: str = "config.yaml") -> None:
-    """Write decided values into one section of the config (used only by notebooks 02 and 03).
+def get_params(cfg: dict, **overrides) -> dict:
+    """Collect everything a backtest run needs into one flat dict, with optional overrides.
 
-    Input:  section name ("parameters"), dict of keys to overwrite, path to the YAML file.
+    Takes the cost and capital settings from `setup` and all of `parameters`, then applies the
+    overrides, e.g. get_params(cfg, entry_z=2.5, stop_z=None). Unknown override names raise an
+    error, so a typo like "entryz" cannot silently be ignored in a sweep.
+
+    Input:  config dict, keyword overrides.
+    Output: flat dict of parameters.
+    """
+    setup = cfg["setup"]
+    params = {
+        "fee_per_leg": setup["fee_per_leg"],
+        "slippage_per_leg": setup["slippage_per_leg"],
+        "initial_capital": setup["initial_capital"],
+        "train_end": setup["train_end"],
+        **cfg["parameters"],
+    }
+    unknown = set(overrides) - set(params)
+    if unknown:
+        raise KeyError(f"Unknown parameter(s) {sorted(unknown)}. Valid names: {sorted(params)}")
+    params.update(overrides)
+    return params
+
+
+def update_config(updates: dict, path: str = "config.yaml") -> None:
+    """Write decided values into the `parameters` section of config.yaml (used in notebooks 02 and 03).
+
+    ruamel.yaml reads and writes the file "round trip", so comments and the layout survive
+    (plain PyYAML would drop all comments). Prints exactly which values changed.
+
+    Input:  dict of parameter name -> new value, e.g. {"pair": ["ETH", "BTC"], "entry_z": 2.5};
+            path to the YAML file.
     Output: None, the file is updated on disk.
     """
-    # TODO: load, update cfg[section], write back (note: yaml.safe_dump drops comments)
-    raise NotImplementedError
+    full_path = Path(path) if Path(path).is_absolute() else REPO_ROOT / path
+    yaml_rt = YAML()                     # round-trip mode keeps comments and key order
+    yaml_rt.preserve_quotes = True       # keep "2023-01-01" quoted
+    yaml_rt.indent(mapping=2, sequence=4, offset=2)  # same list indentation as our file
+    # write None as "null" (ruamel's default would leave the value empty)
+    yaml_rt.representer.add_representer(
+        type(None), lambda rep, _: rep.represent_scalar("tag:yaml.org,2002:null", "null"))
+    with open(full_path) as f:
+        cfg = yaml_rt.load(f)
+
+    params = cfg["parameters"]
+    changed = False
+    for key, new_value in updates.items():
+        if key not in params:
+            raise KeyError(f"'{key}' is not in the parameters section of {full_path.name}.")
+        old_value = params[key]
+        if isinstance(new_value, (list, tuple)):
+            new_value = CommentedSeq(new_value)
+            new_value.fa.set_flow_style()  # write lists inline: [ETH, BTC]
+        if old_value == new_value:
+            print(f"  parameters.{key}: unchanged ({old_value})")
+            continue
+        params[key] = new_value
+        changed = True
+        print(f"  parameters.{key}: {old_value} -> {list(new_value) if isinstance(new_value, list) else new_value}")
+
+    if changed:
+        with open(full_path, "w") as f:
+            yaml_rt.dump(cfg, f)
+        print(f"Saved {full_path.name}. Reload with data.load_config() to use the new values.")
 
 
 def perp_symbol(coin: str) -> str:
