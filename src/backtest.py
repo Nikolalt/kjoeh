@@ -356,6 +356,22 @@ def compute_metrics(result: Result) -> dict:
 # 4. PIPELINE AND PARAMETER SWEEPS
 # =============================================================================
 
+_test_warning_shown = False   # module-level flag: the warning is printed once per Python session
+
+
+def _warn_test_period() -> None:
+    """Print a visible warning the first time the test period is used in this session."""
+    global _test_warning_shown
+    if _test_warning_shown:
+        return
+    _test_warning_shown = True
+    print("=" * 78)
+    print("WARNING: running on the TEST period. Use this only in notebook 04, once,")
+    print("with parameters already fixed in config.yaml. Never tune parameters on it.")
+    print("(This warning is shown once per session.)")
+    print("=" * 78)
+
+
 def run_strategy(
     prices: pd.DataFrame,
     funding: pd.DataFrame | None,
@@ -385,10 +401,7 @@ def run_strategy(
     if period not in ("train", "test"):
         raise ValueError("period must be 'train' or 'test'")
     if period == "test":
-        print("=" * 78)
-        print("WARNING: running on the TEST period. Use this only in notebook 04, once,")
-        print("with parameters already fixed in config.yaml. Never tune parameters on it.")
-        print("=" * 78)
+        _warn_test_period()
 
     name_a, name_b = pair
     # 0) bar length: resample the two legs, and express the hour-based windows in bars

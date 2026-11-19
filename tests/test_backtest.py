@@ -182,3 +182,12 @@ def test_extract_trades_count_direction_holding():
     # trade PnLs add up to the total PnL, and compound to the final equity
     assert trades["pnl_usdt"].sum() == pytest.approx(res.equity.iloc[-1] - 10_000)
     assert np.prod(1 + trades["pnl_pct"]) * 10_000 == pytest.approx(res.equity.iloc[-1])
+
+
+def test_test_period_warning_only_once(capsys, monkeypatch):
+    """The test-period warning is printed the first time only."""
+    from src import backtest
+    monkeypatch.setattr(backtest, "_test_warning_shown", False)
+    backtest._warn_test_period()
+    backtest._warn_test_period()
+    assert capsys.readouterr().out.count("WARNING: running on the TEST period") == 1

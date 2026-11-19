@@ -62,6 +62,10 @@ python src/data.py            # downloads prices + funding into data/ (first run
 python -m pytest              # all tests should pass
 ```
 
+**Every teammate: run `nbstripout --install` once after cloning** (it is in the block above). It sets up a git
+filter in your local clone that removes notebook outputs on commit, so diffs stay small and no test-period results
+end up in the repository. Check with `git config --get filter.nbstripout.clean` (prints a command if installed).
+
 In VS Code / Jupyter, select the `.venv` kernel. If Binance is blocked in your region, set `setup.exchange`
 to `okx` or `bybit` in `config.yaml` and run `python src/data.py` again.
 
