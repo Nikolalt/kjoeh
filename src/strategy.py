@@ -11,6 +11,7 @@ Every number that is a decision (thresholds, windows, switches) is a function ar
 from the params dict; nothing is hard-coded here.
 """
 
+from collections.abc import Callable
 from itertools import combinations
 
 import numpy as np
@@ -244,6 +245,44 @@ def zscore(spread: pd.Series, lookback: int) -> pd.Series:
     return ((spread - mean) / std).rename("z")
 
 
+def frozen_zscore(
+    a: pd.Series, b: pd.Series, beta: pd.Series, alpha: pd.Series, lookback: int
+) -> Callable[[int, int], float]:
+    """Build a function z(entry_bar, t): the z-score at bar t of the spread with the hedge FROZEN at entry.
+
+    Why: once a trade is open we hold fixed units of A and B, bought with the beta of the entry bar.
+    The spread we are actually exposed to is therefore log(a) - beta_entry * log(b) - alpha_entry,
+    not the spread with today's rolling beta. Exits and stops must judge THIS spread; otherwise a
+    moving beta could signal "reverted" while the position we hold has not made any money (or the
+    other way round). While flat, the rolling beta and intercept keep updating the z-score as usual.
+
+    The z-score of the frozen spread over the last `lookback` bars only needs rolling means,
+    variances and the covariance of log(a) and log(b), which we compute once for all bars:
+        mean(spread) = mean(log a) - beta_e * mean(log b) - alpha_e
+        var(spread)  = var(log a) + beta_e^2 * var(log b) - 2 * beta_e * cov(log a, log b)
+    (alpha_e is frozen too, but it shifts spread and mean equally, so it cancels in the z-score.)
+    The result equals zscore(compute_spread(a, b, beta_e, alpha_e), lookback) at every bar.
+
+    Input:  price series a and b, rolling (or constant) beta and alpha Series, z-score lookback in bars.
+    Output: function (entry_bar, t) -> z-score at bar t (integer positions in the index).
+    """
+    log_a, log_b = np.log(a), np.log(b)
+    la, lb = log_a.to_numpy(), log_b.to_numpy()
+    mean_a, mean_b = log_a.rolling(lookback).mean().to_numpy(), log_b.rolling(lookback).mean().to_numpy()
+    var_a, var_b = log_a.rolling(lookback).var().to_numpy(), log_b.rolling(lookback).var().to_numpy()
+    cov_ab = log_a.rolling(lookback).cov(log_b).to_numpy()
+    betas, alphas = beta.to_numpy(), alpha.to_numpy()
+
+    def z_at(entry_bar: int, t: int) -> float:
+        beta_e, alpha_e = betas[entry_bar], alphas[entry_bar]
+        spread = la[t] - beta_e * lb[t] - alpha_e
+        mean = mean_a[t] - beta_e * mean_b[t] - alpha_e
+        std = np.sqrt(var_a[t] + beta_e ** 2 * var_b[t] - 2 * beta_e * cov_ab[t])
+        return (spread - mean) / std
+
+    return z_at
+
+
 def generate_signals(z: pd.Series, entry_z: float, exit_z: float) -> pd.Series:
     """Turn the z-score into a desired direction with a simple state machine.
 
@@ -289,32 +328,39 @@ def apply_risk(
     half_life: float,
     params: dict,
     coint_pvalues: pd.Series | None = None,
-) -> tuple[pd.Series, pd.Series]:
-    """Apply stops, the cointegration filter and position sizing to the raw signals.
+    trade_z: Callable[[int, int], float] | None = None,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Turn raw signals into positions: entries, exits, stops, the cointegration filter and sizing.
 
-    Rules, checked bar by bar while a trade is open (first match wins):
+    Entries (while flat) use the rolling z-score `z` and the raw signals:
+        a new trade needs a fresh signal: entry_z < |z| <= stop_z on the entry bar (beyond stop_z it
+        would be stopped out at once and only cost fees).
+    While a trade is open, the z-score is `trade_z(entry_bar, t)`, i.e. the spread with the hedge
+    ratio frozen at entry (see frozen_zscore); without trade_z the rolling z is used. Exits, checked
+    bar by bar (first match wins):
         z_stop       |z| > stop_z: the spread kept diverging -> close
         time_stop    open for >= time_stop_halflives x half_life hours -> close
         coint_break  rolling cointegration p-value > coint_max_pvalue (only if use_coint_filter)
-        signal       the raw signal says flat (z reverted) or flips direction -> close (and maybe flip)
-    After a forced exit (z_stop, time_stop, coint_break) there is a cooldown: no new entry until |z|
-    has dropped back below entry_z. New entries need a fresh signal, i.e. entry_z < |z| <= stop_z on
-    the entry bar, so we never jump back into an old divergence or open a trade that is already
-    beyond the stop.
+        signal       z is back within exit_z of the mean -> close (a flip can follow on the same bar)
+    After every exit, no new trade in the SAME direction until |z| has been back below entry_z
+    (cooldown). This stops us from re-entering the same divergence right after a stop, or right
+    after the frozen spread reverted while the rolling z-score still looks extreme.
     With use_coint_filter, new entries are also blocked while the p-value is above the threshold
     (or not yet known during the first window).
     An open trade is closed on the last bar ("end_of_data"), so its closing cost is counted.
     Every rule can be switched off: stop_z=None, time_stop_halflives=None, use_coint_filter=False.
-    With all rules off, positions = signals x position_size.
 
-    Input:  raw signals (+1/0/-1), z-score, half-life in hours, params dict with keys entry_z,
-            stop_z, time_stop_halflives, position_size, use_coint_filter, coint_max_pvalue;
-            hourly rolling cointegration p-values (needed only if use_coint_filter).
-    Output: (positions, exit_reasons): positions = direction x position_size; exit_reasons holds
-            "signal", "z_stop", "time_stop", "coint_break" or "end_of_data" on the bar where a trade
-            is closed, None elsewhere.
+    Input:  raw signals (+1/0/-1) from generate_signals, rolling z-score, half-life in hours,
+            params dict with keys entry_z, exit_z, stop_z, time_stop_halflives, position_size,
+            use_coint_filter, coint_max_pvalue; rolling cointegration p-values (needed only if
+            use_coint_filter); optional frozen-hedge z function from frozen_zscore.
+    Output: (positions, exit_reasons, z_used):
+            positions    = direction x position_size
+            exit_reasons = "signal", "z_stop", "time_stop", "coint_break" or "end_of_data" on the bar
+                           where a trade is closed, None elsewhere
+            z_used       = the z-score each decision was based on (frozen-hedge z while in a trade)
     """
-    entry_z = params["entry_z"]
+    entry_z, exit_z = params["entry_z"], params["exit_z"]
     stop_z = params.get("stop_z")
     time_stop = params.get("time_stop_halflives")
     max_hours = time_stop * half_life if time_stop is not None and np.isfinite(half_life) else None
@@ -327,38 +373,39 @@ def apply_risk(
     sig, zs = signals.to_numpy(), z.to_numpy()
     n = len(sig)
     direction = np.zeros(n)
+    z_used = zs.copy()
     reasons = np.full(n, None, dtype=object)
-    state, entry_bar, cooldown = 0, 0, False
+    state, entry_bar = 0, 0
+    blocked = 0          # direction of the last exit; no re-entry in it until |z| < entry_z
 
     for t in range(n):
-        abs_z = abs(zs[t]) if not np.isnan(zs[t]) else np.nan
         coint_ok = (not use_filter) or (not np.isnan(pvalue[t]) and pvalue[t] <= max_pvalue)
 
-        # --- manage an open trade ---
+        # --- manage an open trade, judged on the spread we actually hold ---
         if state != 0:
-            forced = None
-            if stop_z is not None and abs_z > stop_z:
-                forced = "z_stop"
+            z_now = trade_z(entry_bar, t) if trade_z is not None else zs[t]
+            z_used[t] = z_now
+            reverted = (state == 1 and z_now >= -exit_z) or (state == -1 and z_now <= exit_z)
+            exit_reason = None
+            if stop_z is not None and abs(z_now) > stop_z:
+                exit_reason = "z_stop"
             elif max_hours is not None and t - entry_bar >= max_hours:
-                forced = "time_stop"
+                exit_reason = "time_stop"
             elif not coint_ok:
-                forced = "coint_break"
+                exit_reason = "coint_break"
+            elif reverted:
+                exit_reason = "signal"
+            if exit_reason:
+                reasons[t], blocked, state = exit_reason, state, 0
 
-            if forced:
-                state, reasons[t], cooldown = 0, forced, True
-            elif sig[t] != state:            # raw signal exits or flips
-                state, reasons[t] = 0, "signal"
-
-        # --- cooldown ends once the spread is back inside the entry band ---
-        if cooldown and abs_z < entry_z:
-            cooldown = False
-
-        # --- open a new trade (also covers the second half of a flip) ---
-        # fresh signal: |z| beyond entry_z, but not already beyond stop_z (that trade would be
-        # stopped out on the next bar and only cost fees)
+        # --- entries use the rolling z-score ---
+        abs_z = abs(zs[t]) if not np.isnan(zs[t]) else np.nan
+        if blocked and abs_z < entry_z:          # cooldown over: the spread is back inside the band
+            blocked = 0
         fresh_signal = sig[t] != 0 and abs_z > entry_z and (stop_z is None or abs_z <= stop_z)
-        if state == 0 and not cooldown and fresh_signal and coint_ok:
+        if state == 0 and fresh_signal and sig[t] != blocked and coint_ok:
             state, entry_bar = int(sig[t]), t
+            z_used[t] = zs[t]
 
         direction[t] = state
 
@@ -366,6 +413,7 @@ def apply_risk(
     if n and direction[-1] != 0:
         direction[-1], reasons[-1] = 0, "end_of_data"
 
-    positions = pd.Series(direction * params["position_size"], index=signals.index, name="position")
-    exit_reasons = pd.Series(reasons, index=signals.index, name="exit_reason")
-    return positions, exit_reasons
+    index = signals.index
+    positions = pd.Series(direction * params["position_size"], index=index, name="position")
+    exit_reasons = pd.Series(reasons, index=index, name="exit_reason")
+    return positions, exit_reasons, pd.Series(z_used, index=index, name="z")

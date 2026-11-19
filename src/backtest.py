@@ -415,10 +415,20 @@ def run_strategy(
     if params.get("use_coint_filter", False):
         coint_pvalues = strategy.rolling_coint_pvalues(a, b, params["coint_window"], params["coint_step"])
 
-    # 5) restrict to the requested period, then signals -> risk rules -> positions
+    # 5) restrict to the requested period, then signals -> risk rules -> positions.
+    #    While a trade is open, its spread uses the beta and intercept frozen at entry, because the
+    #    units we hold were bought with that hedge ratio and do not change during the trade.
     z_period = z.loc[index]
+    alpha = pd.Series(alpha, index=prices.index)        # a constant (static hedge) becomes a Series
+    frozen_full = strategy.frozen_zscore(a, b, beta, alpha, params["zscore_lookback"])
+    offset = prices.index.get_loc(index[0])             # bar positions in the period -> full history
+
+    def trade_z(entry_bar: int, t: int) -> float:
+        return frozen_full(entry_bar + offset, t + offset)
+
     signals = strategy.generate_signals(z_period, params["entry_z"], params["exit_z"])
-    positions, exit_reasons = strategy.apply_risk(signals, z_period, half_life, params, coint_pvalues)
+    positions, exit_reasons, z_used = strategy.apply_risk(
+        signals, z_period, half_life, params, coint_pvalues, trade_z=trade_z)
 
     # 6) backtest with costs and (optionally) funding
     use_funding = params.get("use_funding", True) and funding is not None
@@ -430,7 +440,7 @@ def run_strategy(
         funding_b=funding[name_b].loc[index] if use_funding else None,
         initial_capital=params["initial_capital"],
         exit_reasons=exit_reasons,
-        z=z_period,
+        z=z_used,
         params=dict(params, pair=tuple(pair), period=period, half_life=half_life),
     )
     result.spread = spread.loc[index]
