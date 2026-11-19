@@ -442,6 +442,32 @@ def load_funding(cfg: dict, coins: list[str] | None = None) -> pd.DataFrame:
     return pd.DataFrame(funding, index=index)
 
 
+def resample_data(
+    prices: pd.DataFrame, funding: pd.DataFrame | None, rule: str
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Resample hourly prices and funding to a longer bar, e.g. "4h" or "1D" ("1h" changes nothing).
+
+    Prices: the close of a longer bar is the close of its last hourly bar (.last()). Bars stay
+    labelled by their OPEN time, like the hourly candles: the 4h bar 04:00 covers 04:00-08:00.
+
+    Funding: summed, but bucketed by when it is PAID relative to the bar, to keep the backtest's
+    timing rule ("funding labelled T is paid by the position held during the bar that ends at T"):
+    an event at time T goes to the label at the END of the interval (t, t + bar] that contains it
+    (closed="right", label="right"). Example with daily bars: the 08:00 and 16:00 payments of
+    Jan 2 are labelled Jan 3 00:00, so the backtest's shift(-1) charges them to the Jan 2 bar, whose
+    position is held at 08:00 and 16:00. With hourly bars this is exactly the original labelling.
+
+    Input:  hourly prices (one column per coin), hourly funding (same layout) or None, pandas rule.
+    Output: (prices, funding) on the new bar grid; funding is 0 in bars without a payment.
+    """
+    bar = pd.Timedelta(rule)                       # "4h" -> 4 hours, "1D" -> 1 day
+    prices_resampled = prices.resample(bar).last()
+    if funding is None:
+        return prices_resampled, None
+    funding_resampled = funding.resample(bar, closed="right", label="right").sum()
+    return prices_resampled, funding_resampled.reindex(prices_resampled.index, fill_value=0.0)
+
+
 def split_train_test(df: pd.DataFrame, train_end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split any time-indexed DataFrame into train (up to and including train_end) and test (after it).
 

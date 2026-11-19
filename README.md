@@ -71,6 +71,7 @@ to `okx` or `bybit` in `config.yaml` and run `python src/data.py` again.
 |---|---|---|---|
 | `01_data` | check data quality, prices, correlations, funding | none | – |
 | `02_pair_selection` | ranking, multiple testing, stability, spreads | which pair | `pair` |
+| `03_calibration` (0) | 1h vs 4h vs 1D bars | bar length | `resample` |
 | `03_calibration` (a) | static vs rolling hedge ratio | hedge ratio method | `hedge_window` |
 | `03_calibration` (b) | sweep entry_z × lookback × exit_z, heatmaps | signal parameters | `entry_z`, `zscore_lookback`, `exit_z` |
 | `03_calibration` (c) | stops on/off, coint filter, stop_z sweep | risk rules | `stop_z`, `time_stop_hours`, `use_coint_filter` |
