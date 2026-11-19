@@ -27,7 +27,8 @@ setup:
   end: "2026-10-31"           # train = [start, train_end], test = (train_end, end]
   max_ffill_bars: 3           # forward-fill price gaps up to this many bars, longer gaps stay NaN
   max_missing_pct: 0.05       # drop a coin if more than this share of hourly bars is missing
-  fee_per_leg: 0.001          # 10 bps per leg per trade (TODO: perp taker fee is lower, decide)
+  fee_per_leg: 0.0005         # 5 bps per leg: Binance USDⓈ-M taker fee, regular user (VIP 0)
+  slippage_per_leg: 0.0002    # 2 bps per leg: assumed price impact / half spread per trade
   initial_capital: 10000      # USDT
 
 parameters:

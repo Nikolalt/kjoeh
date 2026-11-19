@@ -31,6 +31,7 @@ DEFAULT_EXCHANGE = "binanceusdm"   # Binance USDⓈ-M perpetual futures
 CANDLES_PER_REQUEST = 1000         # Binance futures returns at most ~1000-1500 candles per call
 FUNDING_PER_REQUEST = 1000         # Binance returns at most 1000 funding records per call
 MAX_RETRIES = 3                    # retries for temporary network errors before giving up
+CACHE_TOLERANCE = pd.Timedelta("1D")  # a cached file may start/end up to this much inside the range
 
 
 # =============================================================================
@@ -207,37 +208,65 @@ def _funding_path(coin: str) -> Path:
     return DATA_DIR / f"{coin}_funding.parquet"
 
 
+def cache_covers_range(path: Path, start: str, end: str, tolerance: pd.Timedelta = CACHE_TOLERANCE) -> bool:
+    """Check whether a cached parquet file exists and covers the configured date range.
+
+    Without this check, changing setup.start or setup.end in config.yaml would silently keep using
+    an old file with a shorter history. The tolerance allows for small gaps at the edges, e.g. funding
+    is only paid every 8h, so the first event can be a few hours after the start.
+
+    Input:  path to a cached price or funding parquet file, inclusive config dates, tolerance.
+    Output: True if the file exists and its first/last timestamps are within `tolerance` of the range.
+    """
+    if not path.exists():
+        return False
+    index = pd.read_parquet(path).index
+    if len(index) == 0:
+        return False
+    start_ts, end_ts = date_range_utc(start, end)
+    last_bar = end_ts - pd.Timedelta(hours=1)  # the last hourly bar of the range, e.g. 23:00 on the end day
+    return index.min() <= start_ts + tolerance and index.max() >= last_bar - tolerance
+
+
 def download_universe(cfg: dict, force: bool = False) -> None:
     """Fetch prices and funding rates for every coin in the universe and cache them as parquet.
 
-    Files that already exist are skipped, so rerunning is cheap. Use force=True to re-download,
-    e.g. after changing the exchange or the date range in config.yaml.
+    Files that already exist AND cover the configured date range are skipped, so rerunning is cheap.
+    A file that is missing or too short (e.g. after extending setup.end) is re-downloaded automatically.
+    Use force=True to re-download everything, e.g. after changing the exchange in config.yaml.
 
     Input:  config dict (uses setup.exchange, universe, timeframe, start, end), force flag.
     Output: None, writes data/<COIN>.parquet and data/<COIN>_funding.parquet.
     """
     setup = cfg["setup"]
     exchange_id = setup.get("exchange", DEFAULT_EXCHANGE)
+    start, end = setup["start"], setup["end"]
     DATA_DIR.mkdir(exist_ok=True)
     coins = setup["universe"]
-    print(f"Downloading {len(coins)} coins from {exchange_id} ({setup['start']} to {setup['end']}, {setup['timeframe']})")
+    print(f"Downloading {len(coins)} coins from {exchange_id} ({start} to {end}, {setup['timeframe']})")
 
     for i, coin in enumerate(coins, start=1):
         symbol = perp_symbol(coin)
         prefix = f"[{i:>2}/{len(coins)}] {coin:<5}"
 
-        if _price_path(coin).exists() and not force:
+        price_path = _price_path(coin)
+        if not force and cache_covers_range(price_path, start, end):
             print(f"{prefix} prices:  cached, skipped")
         else:
-            prices = fetch_ohlcv(symbol, setup["timeframe"], setup["start"], setup["end"], exchange_id)
-            prices.to_parquet(_price_path(coin))
+            if price_path.exists() and not force:
+                print(f"{prefix} prices:  cached file does not cover {start} to {end}, re-downloading")
+            prices = fetch_ohlcv(symbol, setup["timeframe"], start, end, exchange_id)
+            prices.to_parquet(price_path)
             print(f"{prefix} prices:  {len(prices):>6} bars saved")
 
-        if _funding_path(coin).exists() and not force:
+        funding_path = _funding_path(coin)
+        if not force and cache_covers_range(funding_path, start, end):
             print(f"{prefix} funding: cached, skipped")
         else:
-            funding = fetch_funding_rates(symbol, setup["start"], setup["end"], exchange_id)
-            funding.to_frame().to_parquet(_funding_path(coin))
+            if funding_path.exists() and not force:
+                print(f"{prefix} funding: cached file does not cover {start} to {end}, re-downloading")
+            funding = fetch_funding_rates(symbol, start, end, exchange_id)
+            funding.to_frame().to_parquet(funding_path)
             print(f"{prefix} funding: {len(funding):>6} events saved")
 
 

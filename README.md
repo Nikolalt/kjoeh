@@ -35,7 +35,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 nbstripout --install          # strip notebook outputs on commit
 
-python src/data.py            # download the universe into data/
+python src/data.py            # download the universe into data/ (first run takes about 6 minutes)
 jupyter notebook              # then run notebooks 01 -> 04 in order
 
 python -m pytest              # run tests
