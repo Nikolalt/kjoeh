@@ -86,7 +86,7 @@ def test_cointegration(a: pd.Series, b: pd.Series, adf_maxlag: int = 24) -> dict
     }
 
 
-def adf_levels(prices: pd.DataFrame) -> pd.Series:
+def adf_levels(prices: pd.DataFrame, adf_maxlag: int = 24) -> pd.Series:
     """ADF p-value of each coin's own log price (is the single coin already mean-reverting?).
 
     Why this matters: if log(a) is stationary on its own (e.g. a coin stuck in a range), the
@@ -94,13 +94,13 @@ def adf_levels(prices: pd.DataFrame) -> pd.Series:
     then looks cointegrated although b adds nothing. A real pair has non-stationary legs (high
     p-values here) and a stationary spread.
 
-    Input:  price DataFrame.
+    Input:  price DataFrame, max ADF lags (chosen by AIC up to this many bars).
     Output: Series of ADF p-values, one per coin.
     """
     pvalues = {}
     for coin in prices.columns:
         log_price = np.log(prices[coin].dropna())
-        pvalues[coin] = adfuller(log_price, maxlag=24, autolag="aic", result_object=False)[1]
+        pvalues[coin] = adfuller(log_price, maxlag=adf_maxlag, autolag="aic", result_object=False)[1]
     return pd.Series(pvalues, name="adf_p_value_levels")
 
 
@@ -142,23 +142,38 @@ def rank_pairs(
     adf_maxlag: int = 24,
     window_days: int = 180,
     step_days: int = 30,
+    leg_stationarity_p: float = 0.10,
 ) -> pd.DataFrame:
     """Test every pair of coins for cointegration and rank them by p-value.
+
+    Precondition (both legs must be I(1)): Engle-Granger asks whether two NON-stationary prices
+    share a stationary combination. If one leg is already stationary on its own (ADF p-value of its
+    log price < leg_stationarity_p), the regression just finds a small beta and the "spread" is
+    basically that one coin, so the test looks significant without any real pair relationship
+    (in our train data this happened for LTC). Such pairs are excluded before testing, and the leg
+    p-values are reported as columns p_adf_a and p_adf_b.
 
     Engle-Granger is not symmetric (regressing a on b or b on a gives slightly different results),
     so each pair is tested in both directions and the direction with the lower p-value is kept.
 
-    Multiple testing: with 12 coins there are 66 pairs, i.e. 132 tests. At a 5% level we would
-    expect about 6-7 "significant" results by pure chance even if no pair were cointegrated.
+    Multiple testing: e.g. 55 pairs in 2 directions = 110 tests. At a 5% level we would expect
+    about 5-6 "significant" results by pure chance even if no pair were cointegrated.
     p_bonferroni = p x number of tests (capped at 1) is the simplest, conservative correction:
     only pairs with p_bonferroni < 0.05 are significant after accounting for all tests.
 
-    Input:  price DataFrame (TRAIN data only), ADF lag limit, stability window and step in days.
-    Output: DataFrame, one row per pair: a, b, correlation, p_value, p_bonferroni, adf_stat,
-            beta, half_life (hours), stability, sorted by p_value.
+    Input:  price DataFrame (TRAIN data only), ADF lag limit, stability window and step in days,
+            ADF p-value below which a single leg counts as stationary.
+    Output: DataFrame, one row per tested pair: a, b, correlation, p_value, p_bonferroni, adf_stat,
+            beta, half_life (hours), stability, p_adf_a, p_adf_b, sorted by p_value.
     """
     corr = np.log(prices).diff().corr()
-    pairs = list(combinations(prices.columns, 2))
+    leg_p = adf_levels(prices, adf_maxlag)
+    stationary_legs = set(leg_p.index[leg_p < leg_stationarity_p])
+    all_pairs = list(combinations(prices.columns, 2))
+    pairs = [(x, y) for x, y in all_pairs if x not in stationary_legs and y not in stationary_legs]
+    if stationary_legs:
+        print(f"Excluded {len(all_pairs) - len(pairs)} of {len(all_pairs)} pairs: "
+              f"{sorted(stationary_legs)} stationary on its own (ADF p < {leg_stationarity_p}).")
     n_tests = 2 * len(pairs)  # both directions
 
     rows = []
@@ -177,6 +192,8 @@ def rank_pairs(
             "beta": res["beta"],
             "half_life": res["half_life"],
             "stability": cointegration_stability(prices[a], prices[b], window_days, step_days),
+            "p_adf_a": leg_p[a],
+            "p_adf_b": leg_p[b],
         })
     return pd.DataFrame(rows).sort_values("p_value").reset_index(drop=True)
 
