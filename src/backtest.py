@@ -407,8 +407,10 @@ def run_strategy(
     spread = strategy.compute_spread(a, b, beta, alpha)
     z = strategy.zscore(spread, params["zscore_lookback"])
 
-    # 3) half-life of the traded spread, estimated on train only (used by the time stop)
+    # 3) half-lives on train only, as references for choosing the lookback and the time stop:
+    #    of the traded spread, and of the z-score (how fast a signal typically fades)
     half_life = strategy.half_life(spread.loc[train_index])
+    z_half_life = strategy.half_life(z.loc[train_index])
 
     # 4) optional rolling cointegration p-values for the entry filter
     coint_pvalues = None
@@ -428,7 +430,7 @@ def run_strategy(
 
     signals = strategy.generate_signals(z_period, params["entry_z"], params["exit_z"])
     positions, exit_reasons, z_used = strategy.apply_risk(
-        signals, z_period, half_life, params, coint_pvalues, trade_z=trade_z)
+        signals, z_period, params, coint_pvalues, trade_z=trade_z)
 
     # 6) backtest with costs and (optionally) funding
     use_funding = params.get("use_funding", True) and funding is not None
@@ -441,7 +443,8 @@ def run_strategy(
         initial_capital=params["initial_capital"],
         exit_reasons=exit_reasons,
         z=z_used,
-        params=dict(params, pair=tuple(pair), period=period, half_life=half_life),
+        params=dict(params, pair=tuple(pair), period=period,
+                    half_life_hours=half_life, z_half_life_hours=z_half_life),
     )
     result.spread = spread.loc[index]
     result.beta = beta.loc[index]

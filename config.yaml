@@ -38,7 +38,7 @@ parameters:
   entry_z: 2.0                # open when |z| > entry_z (set in 03b)
   exit_z: 0.0                 # close when z is back within exit_z of the mean (set in 03b)
   stop_z: 3.5                 # z-stop: close when |z| > stop_z; null = off (set in 03c)
-  time_stop_halflives: 2      # time stop: close after N half-lives in a trade; null = off (set in 03c)
+  time_stop_hours: 168        # time stop: close a trade after this many hours; null = off (set in 03c)
   use_coint_filter: false     # block entries while the rolling cointegration p-value is high (03c)
   coint_window: 2160          # bars (90 days) for the rolling cointegration test
   coint_step: 24              # recompute the rolling p-value every 24 bars

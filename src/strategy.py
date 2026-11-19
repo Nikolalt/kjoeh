@@ -342,7 +342,6 @@ def generate_signals(z: pd.Series, entry_z: float, exit_z: float) -> pd.Series:
 def apply_risk(
     signals: pd.Series,
     z: pd.Series,
-    half_life: float,
     params: dict,
     coint_pvalues: pd.Series | None = None,
     trade_z: Callable[[int, int], float] | None = None,
@@ -356,7 +355,7 @@ def apply_risk(
     ratio frozen at entry (see frozen_zscore); without trade_z the rolling z is used. Exits, checked
     bar by bar (first match wins):
         z_stop       |z| > stop_z: the spread kept diverging -> close
-        time_stop    open for >= time_stop_halflives x half_life hours -> close
+        time_stop    open for >= time_stop_hours hours (the spread is not reverting in time) -> close
         coint_break  rolling cointegration p-value > coint_max_pvalue (only if use_coint_filter)
         signal       z is back within exit_z of the mean -> close (a flip can follow on the same bar)
     After every exit, no new trade in the SAME direction until |z| has been back below entry_z
@@ -365,10 +364,10 @@ def apply_risk(
     With use_coint_filter, new entries are also blocked while the p-value is above the threshold
     (or not yet known during the first window).
     An open trade is closed on the last bar ("end_of_data"), so its closing cost is counted.
-    Every rule can be switched off: stop_z=None, time_stop_halflives=None, use_coint_filter=False.
+    Every rule can be switched off: stop_z=None, time_stop_hours=None, use_coint_filter=False.
 
-    Input:  raw signals (+1/0/-1) from generate_signals, rolling z-score, half-life in hours,
-            params dict with keys entry_z, exit_z, stop_z, time_stop_halflives, position_size,
+    Input:  raw signals (+1/0/-1) from generate_signals, rolling z-score (time index),
+            params dict with keys entry_z, exit_z, stop_z, time_stop_hours, position_size,
             use_coint_filter, coint_max_pvalue; rolling cointegration p-values (needed only if
             use_coint_filter); optional frozen-hedge z function from frozen_zscore.
     Output: (positions, exit_reasons, z_used):
@@ -379,8 +378,9 @@ def apply_risk(
     """
     entry_z, exit_z = params["entry_z"], params["exit_z"]
     stop_z = params.get("stop_z")
-    time_stop = params.get("time_stop_halflives")
-    max_hours = time_stop * half_life if time_stop is not None and np.isfinite(half_life) else None
+    max_hours = params.get("time_stop_hours")
+    # hours since the first bar, so the time stop works for any bar length (1h, 4h, 1d)
+    hours = ((z.index - z.index[0]) / pd.Timedelta(hours=1)).to_numpy()
     use_filter = params.get("use_coint_filter", False)
     max_pvalue = params.get("coint_max_pvalue")
     if use_filter:
@@ -406,7 +406,7 @@ def apply_risk(
             exit_reason = None
             if stop_z is not None and abs(z_now) > stop_z:
                 exit_reason = "z_stop"
-            elif max_hours is not None and t - entry_bar >= max_hours:
+            elif max_hours is not None and hours[t] - hours[entry_bar] >= max_hours:
                 exit_reason = "time_stop"
             elif not coint_ok:
                 exit_reason = "coint_break"

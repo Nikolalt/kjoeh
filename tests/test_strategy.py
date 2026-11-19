@@ -13,7 +13,7 @@ def hourly_series(values) -> pd.Series:
 
 
 def base_params(**overrides) -> dict:
-    params = {"entry_z": 2.0, "exit_z": 0.0, "stop_z": None, "time_stop_halflives": None,
+    params = {"entry_z": 2.0, "exit_z": 0.0, "stop_z": None, "time_stop_hours": None,
               "position_size": 1.0, "use_coint_filter": False, "coint_max_pvalue": 0.1}
     params.update(overrides)
     return params
@@ -51,7 +51,7 @@ def test_no_rules_positions_equal_scaled_signals():
     """With every risk rule switched off, positions are just signals x position_size."""
     z = hourly_series([0, -2.5, -1, 0.5, 2.5, 1, -0.5, 0])
     signals = strategy.generate_signals(z, 2.0, 0.0)
-    positions, reasons, _ = strategy.apply_risk(signals, z, half_life=10, params=base_params(position_size=0.5))
+    positions, reasons, _ = strategy.apply_risk(signals, z, params=base_params(position_size=0.5))
     assert positions.tolist() == (signals * 0.5).tolist()
     assert reasons.dropna().tolist() == ["signal", "signal"]
 
@@ -60,7 +60,7 @@ def test_z_stop_triggers_and_cooldown():
     """Close when |z| > stop_z; no re-entry until |z| < entry_z and a fresh signal appears."""
     z = hourly_series([0, -2.5, -3.0, -4.0, -3.0, -2.5, -1.5, -2.5, 0.5])
     signals = strategy.generate_signals(z, 2.0, 0.0)   # raw: long from bar 1 to bar 7
-    positions, reasons, _ = strategy.apply_risk(signals, z, half_life=100, params=base_params(stop_z=3.5))
+    positions, reasons, _ = strategy.apply_risk(signals, z, params=base_params(stop_z=3.5))
 
     #                     0  1  2  3  4  5  6  7  8
     assert positions.tolist() == [0, 1, 1, 0, 0, 0, 0, 1, 0]
@@ -73,17 +73,17 @@ def test_no_entry_beyond_stop():
     """A signal that appears with |z| already beyond stop_z is not traded (it would be stopped at once)."""
     z = hourly_series([0, -4.0, -3.0, -1.0])
     signals = strategy.generate_signals(z, 2.0, 0.0)   # raw: long from bar 1
-    positions, _, _ = strategy.apply_risk(signals, z, half_life=100, params=base_params(stop_z=3.5))
+    positions, _, _ = strategy.apply_risk(signals, z, params=base_params(stop_z=3.5))
     assert positions.tolist() == [0, 0, 1, 0]   # bar 2: |z| = 3 is inside (2, 3.5] -> enter
 
 
 def test_time_stop_triggers():
-    """Close after time_stop_halflives x half_life hours, even if z has not reverted."""
+    """Close after time_stop_hours, even if z has not reverted."""
     z = hourly_series([0, -2.5, -2.2, -2.1, -2.1, -2.1, -2.1, -1.0])
     signals = strategy.generate_signals(z, 2.0, 0.0)
-    # half-life 1.5 h x 2 = 3 h: entered at bar 1 -> closed at bar 4
+    # time stop 3 h: entered at bar 1 -> closed at bar 4
     positions, reasons, _ = strategy.apply_risk(
-        signals, z, half_life=1.5, params=base_params(time_stop_halflives=2))
+        signals, z, params=base_params(time_stop_hours=3))
     assert positions.tolist() == [0, 1, 1, 1, 0, 0, 0, 0]
     assert reasons.iloc[4] == "time_stop"
 
@@ -91,7 +91,7 @@ def test_time_stop_triggers():
 def test_open_trade_closed_at_end_of_data():
     z = hourly_series([0, -2.5, -2.0, -1.5])
     signals = strategy.generate_signals(z, 2.0, 0.0)
-    positions, reasons, _ = strategy.apply_risk(signals, z, half_life=10, params=base_params())
+    positions, reasons, _ = strategy.apply_risk(signals, z, params=base_params())
     assert positions.tolist() == [0, 1, 1, 0]
     assert reasons.iloc[-1] == "end_of_data"
 
@@ -118,7 +118,7 @@ def test_trade_exits_on_frozen_z_not_rolling_z():
     frozen = {2: -1.5, 3: 0.1, 4: 0.5, 5: 0.5}                      # frozen z reverts at bar 3
     signals = strategy.generate_signals(z_rolling, 2.0, 0.0)
     positions, reasons, z_used = strategy.apply_risk(
-        signals, z_rolling, half_life=100, params=base_params(),
+        signals, z_rolling, params=base_params(),
         trade_z=lambda entry_bar, t: frozen[t])
 
     assert positions.tolist() == [0, 1, 1, 0, 0, 0]
