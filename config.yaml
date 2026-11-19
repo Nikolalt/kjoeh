@@ -7,29 +7,31 @@
 # =============================================================================
 
 setup:
-  exchange: binance
-  universe:
-    - BTC/USDT
-    - ETH/USDT
-    - SOL/USDT
-    - BNB/USDT
-    - XRP/USDT
-    - ADA/USDT
-    - AVAX/USDT
-    - LINK/USDT
-    - DOT/USDT
-    - LTC/USDT
-    - DOGE/USDT
-    - TRX/USDT
+  exchange: binanceusdm       # ccxt id: Binance USDⓈ-M perpetual futures (fallback: okx, bybit)
+  universe:                   # base coins; data.py maps them to perpetuals, e.g. BTC -> BTC/USDT:USDT
+    - BTC
+    - ETH
+    - SOL
+    - BNB
+    - XRP
+    - ADA
+    - AVAX
+    - LINK
+    - DOT
+    - LTC
+    - DOGE
+    - TRX
   timeframe: 1h
   start: "2023-01-01"
-  train_end: "2025-01-01"     # train = [start, train_end), test = [train_end, end)
-  end: "2026-01-01"
-  fee_per_leg: 0.001          # 10 bps per leg per trade (Binance spot taker)
+  train_end: "2025-12-31"     # dates are whole days, inclusive:
+  end: "2026-10-31"           # train = [start, train_end], test = (train_end, end]
+  max_ffill_bars: 3           # forward-fill price gaps up to this many bars, longer gaps stay NaN
+  max_missing_pct: 0.05       # drop a coin if more than this share of hourly bars is missing
+  fee_per_leg: 0.001          # 10 bps per leg per trade (TODO: perp taker fee is lower, decide)
   initial_capital: 10000      # USDT
 
 parameters:
-  pair: null                  # e.g. [ETH/USDT, BTC/USDT], set in 02_pair_selection
+  pair: null                  # e.g. [ETH, BTC], set in 02_pair_selection
   hedge_window: 720           # bars for rolling hedge ratio (placeholder, set in 03)
   zscore_lookback: 168        # bars for rolling z-score (placeholder, set in 03)
   entry_z: 2.0                # open when |z| > entry_z

@@ -1,19 +1,47 @@
-"""Data layer: config handling, downloading OHLCV from the exchange, loading clean prices.
+"""Data layer: config handling, downloading perpetual prices and funding rates, loading clean data.
+
+We trade crypto *perpetual futures*, because shorting one leg of a pair is only practical with perps.
+So for every coin we need two things:
+    1. hourly OHLCV candles of the perpetual       -> data/<COIN>.parquet
+    2. the funding rate history (paid every ~8h)   -> data/<COIN>_funding.parquet
 
 Run `python src/data.py` once to download the full universe into data/.
+
+Time conventions (important for the backtest):
+    - All timestamps are UTC.
+    - A candle is labelled with its OPEN time (ccxt convention): the bar at 07:00 covers 07:00-08:00,
+      and its close price is the price at 08:00.
+    - Funding is labelled with the instant it is paid (e.g. 08:00). It is paid by whoever holds a
+      position at that instant, i.e. the position carried from bar 07:00 into bar 08:00.
+    - Funding sign: a positive rate means longs pay shorts, a negative rate means shorts pay longs.
+    - Config dates are whole days and inclusive: end "2026-10-31" includes the 23:00 bar of that day.
 """
 
+import time
 from pathlib import Path
 
+import ccxt
 import pandas as pd
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 
+DEFAULT_EXCHANGE = "binanceusdm"   # Binance USDⓈ-M perpetual futures
+CANDLES_PER_REQUEST = 1000         # Binance futures returns at most ~1000-1500 candles per call
+FUNDING_PER_REQUEST = 1000         # Binance returns at most 1000 funding records per call
+MAX_RETRIES = 3                    # retries for temporary network errors before giving up
+
+
+# =============================================================================
+# 1. CONFIG
+# =============================================================================
 
 def load_config(path: str = "config.yaml") -> dict:
     """Read the project config from YAML (relative paths are resolved against the repo root).
+
+    Resolving against the repo root (not the current working directory) means the same call works
+    from the repo root, from notebooks/ and from src/.
 
     Input:  path to the YAML file.
     Output: dict with the two sections "setup" and "parameters".
@@ -33,45 +61,323 @@ def update_config(section: str, values: dict, path: str = "config.yaml") -> None
     raise NotImplementedError
 
 
-def fetch_ohlcv(symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame:
-    """Download OHLCV candles for one symbol from Binance via ccxt, paginating over the date range.
+def perp_symbol(coin: str) -> str:
+    """Map a base coin to its ccxt USDT-margined perpetual symbol, e.g. "BTC" -> "BTC/USDT:USDT".
 
-    Input:  symbol (e.g. "BTC/USDT"), timeframe (e.g. "1h"), start and end dates as "YYYY-MM-DD".
-    Output: DataFrame with columns open, high, low, close, volume and a UTC DatetimeIndex.
+    The ":USDT" suffix is ccxt's notation for a linear perpetual settled in USDT.
     """
-    # TODO: ccxt.binance().fetch_ohlcv in a loop (limit ~1000 bars per call), respect rate limit
-    raise NotImplementedError
+    return f"{coin}/USDT:USDT"
 
 
-def download_universe(cfg: dict) -> None:
-    """Fetch every symbol in the universe and cache each one to data/ as a parquet file.
+def date_range_utc(start: str, end: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Turn inclusive config dates into a half-open UTC interval [start, end + 1 day).
 
-    Input:  config dict (uses setup.universe, timeframe, start, end).
-    Output: None, writes one file per symbol, e.g. data/BTC_USDT_1h.parquet.
+    Example: ("2023-01-01", "2026-10-31") -> [2023-01-01 00:00, 2026-11-01 00:00).
     """
-    # TODO: loop over cfg["setup"]["universe"], call fetch_ohlcv, save with to_parquet
-    raise NotImplementedError
+    start_ts = pd.Timestamp(start, tz="UTC").normalize()
+    end_ts = pd.Timestamp(end, tz="UTC").normalize() + pd.Timedelta(days=1)
+    return start_ts, end_ts
 
 
-def load_prices(cfg: dict) -> pd.DataFrame:
-    """Load the cached parquet files and build one aligned, cleaned table of close prices.
+def hourly_index(cfg: dict) -> pd.DatetimeIndex:
+    """The complete hourly UTC grid from setup.start to setup.end (both days inclusive).
+
+    Prices and funding are both put on this grid, so they line up row by row.
+    """
+    start_ts, end_ts = date_range_utc(cfg["setup"]["start"], cfg["setup"]["end"])
+    freq = pd.Timedelta(cfg["setup"]["timeframe"])
+    return pd.date_range(start_ts, end_ts, freq=freq, inclusive="left", name="timestamp")
+
+
+# =============================================================================
+# 2. DOWNLOAD FROM THE EXCHANGE
+# =============================================================================
+
+def _exchange_error_message(exchange_id: str, err: Exception) -> str:
+    """Readable error text for a blocked or failing exchange, with the suggested fix."""
+    return (
+        f"Download from '{exchange_id}' failed: {type(err).__name__}: {err}\n"
+        f"The exchange may be blocked in your region (e.g. HTTP 451/403) or temporarily down.\n"
+        f"Fix: set `setup.exchange` in config.yaml to another perpetual-futures venue, "
+        f"e.g. 'okx' or 'bybit' (symbols like BTC/USDT:USDT work the same there), "
+        f"then rerun with force=True."
+    )
+
+
+def _make_exchange(exchange_id: str = DEFAULT_EXCHANGE) -> ccxt.Exchange:
+    """Create a ccxt exchange object with the built-in rate limiter switched on.
+
+    enableRateLimit makes ccxt wait between calls by itself, so we never exceed the API limits.
+    defaultType 'swap' makes multi-market exchanges (okx, bybit) use perpetuals, not spot.
+    """
+    if not hasattr(ccxt, exchange_id):
+        raise ValueError(f"Unknown ccxt exchange id '{exchange_id}' in config.yaml (setup.exchange).")
+    exchange_class = getattr(ccxt, exchange_id)
+    return exchange_class({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+
+
+def _call_with_retry(exchange: ccxt.Exchange, method: str, *args, **kwargs):
+    """Call an exchange method, retrying temporary network errors and failing with a clear message.
+
+    - ccxt.NetworkError (timeouts, dropped connections) is often temporary -> wait and retry.
+    - Anything else from ccxt (blocked region, bad symbol, ...) -> raise a RuntimeError with a hint.
+    """
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return getattr(exchange, method)(*args, **kwargs)
+        except ccxt.NetworkError as err:
+            # ExchangeNotAvailable (incl. geo-blocks) is a NetworkError subclass, but retrying won't help
+            if attempt == MAX_RETRIES or isinstance(err, ccxt.ExchangeNotAvailable):
+                raise RuntimeError(_exchange_error_message(exchange.id, err)) from err
+            time.sleep(2 * attempt)
+        except ccxt.BaseError as err:
+            raise RuntimeError(_exchange_error_message(exchange.id, err)) from err
+
+
+def fetch_ohlcv(
+    symbol: str, timeframe: str, start: str, end: str, exchange_id: str = DEFAULT_EXCHANGE
+) -> pd.DataFrame:
+    """Download OHLCV candles for one perpetual via ccxt, paginating over the date range.
+
+    The exchange returns at most ~1000 candles per request, so we loop: ask for 1000 candles
+    starting at `since`, then move `since` to just after the last candle we got, until we pass `end`.
+
+    Input:  symbol (e.g. "BTC/USDT:USDT"), timeframe (e.g. "1h"), start and end dates "YYYY-MM-DD"
+            (both inclusive), ccxt exchange id (default binanceusdm).
+    Output: DataFrame with columns open, high, low, close, volume and a UTC DatetimeIndex (open time).
+    """
+    exchange = _make_exchange(exchange_id)
+    start_ts, end_ts = date_range_utc(start, end)
+    end_ms = int(end_ts.timestamp() * 1000)
+    step_ms = exchange.parse_timeframe(timeframe) * 1000  # length of one candle in milliseconds
+
+    rows = []
+    since = int(start_ts.timestamp() * 1000)
+    while since < end_ms:
+        batch = _call_with_retry(exchange, "fetch_ohlcv", symbol, timeframe, since, CANDLES_PER_REQUEST)
+        if not batch:  # nothing more available (e.g. reached the present)
+            break
+        rows.extend(batch)
+        since = batch[-1][0] + step_ms  # next request starts one candle after the last one received
+
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.drop_duplicates("timestamp").set_index("timestamp").sort_index()
+    return df[df.index < end_ts]  # the last request may overshoot the end date
+
+
+def fetch_funding_rates(
+    symbol: str, start: str, end: str, exchange_id: str = DEFAULT_EXCHANGE
+) -> pd.Series:
+    """Download the funding rate history of one perpetual via ccxt, paginating over the date range.
+
+    Funding is usually paid every 8h (00:00, 08:00, 16:00 UTC); some coins switch to 4h or 1h in
+    volatile periods. Each record is a rate per funding event (e.g. 0.0001 = 0.01% of notional).
+
+    Input:  symbol (e.g. "BTC/USDT:USDT"), start and end dates "YYYY-MM-DD" (inclusive), exchange id.
+    Output: Series "funding_rate" with a UTC DatetimeIndex (time the funding was paid).
+    """
+    exchange = _make_exchange(exchange_id)
+    start_ts, end_ts = date_range_utc(start, end)
+    end_ms = int(end_ts.timestamp() * 1000)
+
+    records = []
+    since = int(start_ts.timestamp() * 1000)
+    while since < end_ms:
+        batch = _call_with_retry(exchange, "fetch_funding_rate_history", symbol, since, FUNDING_PER_REQUEST)
+        if not batch:
+            break
+        records.extend(batch)
+        since = batch[-1]["timestamp"] + 1  # continue just after the last record received
+
+    if not records:
+        return pd.Series(dtype=float, name="funding_rate")
+    df = pd.DataFrame([(r["timestamp"], r["fundingRate"]) for r in records], columns=["timestamp", "funding_rate"])
+    # Binance stamps some events a few ms late (e.g. 08:00:00.008), so round to the full second
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True).dt.round("s")
+    s = df.drop_duplicates("timestamp").set_index("timestamp")["funding_rate"].sort_index()
+    return s[s.index < end_ts]
+
+
+def _price_path(coin: str) -> Path:
+    return DATA_DIR / f"{coin}.parquet"
+
+
+def _funding_path(coin: str) -> Path:
+    return DATA_DIR / f"{coin}_funding.parquet"
+
+
+def download_universe(cfg: dict, force: bool = False) -> None:
+    """Fetch prices and funding rates for every coin in the universe and cache them as parquet.
+
+    Files that already exist are skipped, so rerunning is cheap. Use force=True to re-download,
+    e.g. after changing the exchange or the date range in config.yaml.
+
+    Input:  config dict (uses setup.exchange, universe, timeframe, start, end), force flag.
+    Output: None, writes data/<COIN>.parquet and data/<COIN>_funding.parquet.
+    """
+    setup = cfg["setup"]
+    exchange_id = setup.get("exchange", DEFAULT_EXCHANGE)
+    DATA_DIR.mkdir(exist_ok=True)
+    coins = setup["universe"]
+    print(f"Downloading {len(coins)} coins from {exchange_id} ({setup['start']} to {setup['end']}, {setup['timeframe']})")
+
+    for i, coin in enumerate(coins, start=1):
+        symbol = perp_symbol(coin)
+        prefix = f"[{i:>2}/{len(coins)}] {coin:<5}"
+
+        if _price_path(coin).exists() and not force:
+            print(f"{prefix} prices:  cached, skipped")
+        else:
+            prices = fetch_ohlcv(symbol, setup["timeframe"], setup["start"], setup["end"], exchange_id)
+            prices.to_parquet(_price_path(coin))
+            print(f"{prefix} prices:  {len(prices):>6} bars saved")
+
+        if _funding_path(coin).exists() and not force:
+            print(f"{prefix} funding: cached, skipped")
+        else:
+            funding = fetch_funding_rates(symbol, setup["start"], setup["end"], exchange_id)
+            funding.to_frame().to_parquet(_funding_path(coin))
+            print(f"{prefix} funding: {len(funding):>6} events saved")
+
+
+# =============================================================================
+# 3. LOAD CLEAN, ALIGNED DATA
+# =============================================================================
+
+def load_raw_closes(cfg: dict) -> pd.DataFrame:
+    """Read the cached close prices of all coins onto the complete hourly grid, WITHOUT any cleaning.
+
+    Missing candles show up as NaN, which is what the quality report counts.
 
     Input:  config dict.
-    Output: DataFrame with one column per coin (e.g. "BTC"), hourly UTC index, no NaNs.
+    Output: DataFrame of close prices, one column per coin (e.g. "BTC"), full hourly UTC index.
     """
-    # TODO: read parquet files, keep close, join on index, reindex to full hourly grid,
-    #       forward-fill small gaps, drop coins or rows with too much missing data
-    raise NotImplementedError
+    index = hourly_index(cfg)
+    closes = {}
+    for coin in cfg["setup"]["universe"]:
+        path = _price_path(coin)
+        if not path.exists():
+            raise FileNotFoundError(f"{path} not found. Run `python src/data.py` first to download the data.")
+        closes[coin] = pd.read_parquet(path)["close"].reindex(index)
+    return pd.DataFrame(closes, index=index)
 
 
-def split_train_test(prices: pd.DataFrame, train_end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split prices at the cutoff date into a train part (before) and a test part (from cutoff on).
+def data_quality(raw: pd.DataFrame) -> pd.DataFrame:
+    """Per-coin data-quality summary of raw (uncleaned) prices on the full hourly grid.
 
-    Input:  price DataFrame, cutoff date "YYYY-MM-DD".
+    Input:  output of load_raw_closes.
+    Output: DataFrame with one row per coin: bars, missing_bars, missing_pct, longest_gap (bars),
+            first and last timestamp with data.
+    """
+    rows = {}
+    for coin, s in raw.items():
+        missing = s.isna()
+        # length of each run of consecutive NaNs -> the longest one is the worst gap
+        run_id = (~missing).cumsum()
+        longest_gap = int(missing.groupby(run_id).sum().max()) if missing.any() else 0
+        rows[coin] = {
+            "bars": int(s.notna().sum()),
+            "missing_bars": int(missing.sum()),
+            "missing_pct": missing.mean(),
+            "longest_gap": longest_gap,
+            "first": s.first_valid_index(),
+            "last": s.last_valid_index(),
+        }
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def fill_short_gaps(s: pd.Series, max_gap: int) -> pd.Series:
+    """Forward-fill gaps of at most `max_gap` consecutive NaNs; longer gaps stay completely NaN.
+
+    Note: pandas' ffill(limit=n) would also fill the first n bars of a long gap, which would hide
+    an outage. Here a gap is either filled as a whole or not at all.
+    """
+    missing = s.isna()
+    run_id = (~missing).cumsum()                         # same id for a value and the NaNs after it
+    gap_len = missing.groupby(run_id).transform("sum")   # length of the gap each NaN belongs to
+    fill_mask = missing & (gap_len <= max_gap)
+    return s.where(~fill_mask, s.ffill())
+
+
+def load_prices(cfg: dict, verbose: bool = True) -> pd.DataFrame:
+    """Load cached prices into one aligned, cleaned table of close prices.
+
+    Steps: put every coin on the complete hourly UTC grid -> report data quality -> forward-fill
+    short gaps (<= setup.max_ffill_bars) -> drop coins with more than setup.max_missing_pct missing.
+
+    Input:  config dict, verbose flag (print the quality report).
+    Output: DataFrame with one column per remaining coin (e.g. "BTC"), hourly UTC index.
+            Longer gaps remain NaN, so downstream code must handle (or drop) them explicitly.
+    """
+    setup = cfg["setup"]
+    max_gap = setup.get("max_ffill_bars", 3)
+    max_missing = setup.get("max_missing_pct", 0.05)
+
+    raw = load_raw_closes(cfg)
+    report = data_quality(raw)
+    if verbose:
+        print("Data quality (raw, before cleaning):")
+        print(report.to_string(formatters={"missing_pct": "{:.2%}".format}))
+
+    prices = raw.apply(fill_short_gaps, max_gap=max_gap)
+
+    too_sparse = report.index[report["missing_pct"] > max_missing].tolist()
+    if too_sparse:
+        print(f"WARNING: dropping {too_sparse}: more than {max_missing:.0%} of hourly bars missing.")
+        prices = prices.drop(columns=too_sparse)
+    if verbose:
+        print(f"Kept {prices.shape[1]} coins, {prices.isna().sum().sum()} NaNs left after filling gaps <= {max_gap} bars.")
+    return prices
+
+
+def load_funding(cfg: dict, coins: list[str] | None = None) -> pd.DataFrame:
+    """Load cached funding rates onto the same hourly UTC grid as the prices.
+
+    Each cell holds the funding rate paid at that hour, and 0 in hours without a funding event.
+    That way the backtest can simply sum funding per bar: cost of a leg = -position * rate.
+
+    Input:  config dict, optional list of coins (default: the whole universe).
+    Output: DataFrame of funding rates, one column per coin, full hourly UTC index.
+    """
+    index = hourly_index(cfg)
+    coins = coins if coins is not None else cfg["setup"]["universe"]
+    funding = {}
+    for coin in coins:
+        path = _funding_path(coin)
+        if not path.exists():
+            raise FileNotFoundError(f"{path} not found. Run `python src/data.py` first to download the data.")
+        s = pd.read_parquet(path)["funding_rate"]
+        # snap every event to its hour (events are on the hour anyway) and add up if two land in one hour
+        s = s.groupby(s.index.floor("h")).sum()
+        funding[coin] = s.reindex(index, fill_value=0.0)
+    return pd.DataFrame(funding, index=index)
+
+
+def split_train_test(df: pd.DataFrame, train_end: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split any time-indexed DataFrame into train (up to and including train_end) and test (after it).
+
+    train_end is a whole day: "2025-12-31" puts the 23:00 bar of Dec 31 in train, and the test
+    period starts strictly after it, at 2026-01-01 00:00.
+
+    Input:  DataFrame with a UTC DatetimeIndex, cutoff date "YYYY-MM-DD".
     Output: (train, test) DataFrames with no overlapping timestamps.
     """
-    raise NotImplementedError
+    cutoff = pd.Timestamp(train_end, tz="UTC").normalize() + pd.Timedelta(days=1)
+    return df[df.index < cutoff], df[df.index >= cutoff]
 
 
 if __name__ == "__main__":
-    download_universe(load_config())
+    cfg = load_config()
+    download_universe(cfg)
+    print()
+    prices = load_prices(cfg)
+    funding = load_funding(cfg, coins=list(prices.columns))
+    train, test = split_train_test(prices, cfg["setup"]["train_end"])
+    print(f"\nPrices:  {prices.shape[0]} bars x {prices.shape[1]} coins, {prices.index[0]} to {prices.index[-1]}")
+    print(f"Train:   {len(train)} bars ({train.index[0]} to {train.index[-1]})")
+    print(f"Test:    {len(test)} bars ({test.index[0]} to {test.index[-1]})")
+    # mean funding per hour x hours per year = average annualized funding a long position pays
+    annual_funding = funding.mean() * 24 * 365
+    print("Average annualized funding (paid by longs):")
+    print(annual_funding.map("{:.2%}".format).to_string())
