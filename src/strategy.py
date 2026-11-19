@@ -16,7 +16,7 @@ from itertools import combinations
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from statsmodels.tsa.stattools import coint
+from statsmodels.tsa.stattools import adfuller, coint
 
 
 # =============================================================================
@@ -83,6 +83,24 @@ def test_cointegration(a: pd.Series, b: pd.Series, adf_maxlag: int = 24) -> dict
         "p_value": p_value,
         "half_life": half_life(spread),
     }
+
+
+def adf_levels(prices: pd.DataFrame) -> pd.Series:
+    """ADF p-value of each coin's own log price (is the single coin already mean-reverting?).
+
+    Why this matters: if log(a) is stationary on its own (e.g. a coin stuck in a range), the
+    regression of a on b finds a small beta and the "spread" is basically log(a) itself. The pair
+    then looks cointegrated although b adds nothing. A real pair has non-stationary legs (high
+    p-values here) and a stationary spread.
+
+    Input:  price DataFrame.
+    Output: Series of ADF p-values, one per coin.
+    """
+    pvalues = {}
+    for coin in prices.columns:
+        log_price = np.log(prices[coin].dropna())
+        pvalues[coin] = adfuller(log_price, maxlag=24, autolag="aic", result_object=False)[1]
+    return pd.Series(pvalues, name="adf_p_value_levels")
 
 
 def rolling_coint_pvalues(a: pd.Series, b: pd.Series, window: int, step: int) -> pd.Series:
@@ -280,8 +298,9 @@ def apply_risk(
         coint_break  rolling cointegration p-value > coint_max_pvalue (only if use_coint_filter)
         signal       the raw signal says flat (z reverted) or flips direction -> close (and maybe flip)
     After a forced exit (z_stop, time_stop, coint_break) there is a cooldown: no new entry until |z|
-    has dropped back below entry_z. New entries need a fresh signal, i.e. |z| > entry_z on the entry
-    bar, so we never jump back into an old, already stopped divergence.
+    has dropped back below entry_z. New entries need a fresh signal, i.e. entry_z < |z| <= stop_z on
+    the entry bar, so we never jump back into an old divergence or open a trade that is already
+    beyond the stop.
     With use_coint_filter, new entries are also blocked while the p-value is above the threshold
     (or not yet known during the first window).
     An open trade is closed on the last bar ("end_of_data"), so its closing cost is counted.
@@ -335,7 +354,9 @@ def apply_risk(
             cooldown = False
 
         # --- open a new trade (also covers the second half of a flip) ---
-        fresh_signal = sig[t] != 0 and abs_z > entry_z
+        # fresh signal: |z| beyond entry_z, but not already beyond stop_z (that trade would be
+        # stopped out on the next bar and only cost fees)
+        fresh_signal = sig[t] != 0 and abs_z > entry_z and (stop_z is None or abs_z <= stop_z)
         if state == 0 and not cooldown and fresh_signal and coint_ok:
             state, entry_bar = int(sig[t]), t
 

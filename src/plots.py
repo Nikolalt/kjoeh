@@ -180,6 +180,52 @@ def plot_pair_ranking(
     return _finish(fig, save)
 
 
+def plot_series(
+    series: pd.DataFrame | dict,
+    title: str,
+    ylabel: str,
+    hline: float | None = None,
+    vline: str | None = None,
+    save: str | None = None,
+) -> plt.Figure:
+    """Generic line chart for a few time series (e.g. rolling funding, rolling p-values, beta).
+
+    Input:  DataFrame (one line per column) or dict label -> Series, title, y-axis label,
+            optional horizontal reference line (value), optional vertical line (date, e.g. train end),
+            save file name.
+    Output: Figure.
+    """
+    frame = pd.DataFrame(series)
+    fig, ax = plt.subplots(figsize=(12, 4))
+    for i, column in enumerate(frame.columns):
+        ax.plot(frame.index, frame[column], color=PALETTE[i % len(PALETTE)], lw=1.2, label=str(column))
+    if hline is not None:
+        ax.axhline(hline, color=INK, ls="--", lw=1)
+    if vline is not None:
+        ax.axvline(pd.Timestamp(vline, tz="UTC"), color=INK, ls="--", lw=1, label="train end")
+    ax.set_title(title)
+    ax.set_xlabel("Date (UTC)")
+    ax.set_ylabel(ylabel)
+    if frame.shape[1] > 1 or vline is not None:
+        ax.legend(loc="upper left", ncol=4)
+    return _finish(fig, save)
+
+
+def plot_bars(values: pd.Series, title: str, ylabel: str, save: str | None = None) -> plt.Figure:
+    """Generic bar chart of one value per category (e.g. annualised funding per coin).
+
+    Input:  Series (index = categories), title, y-axis label, save file name.
+    Output: Figure.
+    """
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(values.index.astype(str), values, color=PALETTE[0], width=0.6)
+    ax.axhline(0, color=INK, lw=0.8)
+    ax.set_title(title)
+    ax.set_xlabel(values.index.name or "")
+    ax.set_ylabel(ylabel)
+    return _finish(fig, save)
+
+
 # =============================================================================
 # SIGNALS AND TRADES
 # =============================================================================

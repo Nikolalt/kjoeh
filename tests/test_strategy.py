@@ -68,6 +68,14 @@ def test_z_stop_triggers_and_cooldown():
     assert reasons.iloc[8] == "signal"
 
 
+def test_no_entry_beyond_stop():
+    """A signal that appears with |z| already beyond stop_z is not traded (it would be stopped at once)."""
+    z = hourly_series([0, -4.0, -3.0, -1.0])
+    signals = strategy.generate_signals(z, 2.0, 0.0)   # raw: long from bar 1
+    positions, _ = strategy.apply_risk(signals, z, half_life=100, params=base_params(stop_z=3.5))
+    assert positions.tolist() == [0, 0, 1, 0]   # bar 2: |z| = 3 is inside (2, 3.5] -> enter
+
+
 def test_time_stop_triggers():
     """Close after time_stop_halflives x half_life hours, even if z has not reverted."""
     z = hourly_series([0, -2.5, -2.2, -2.1, -2.1, -2.1, -2.1, -1.0])

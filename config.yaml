@@ -32,7 +32,7 @@ setup:
   initial_capital: 10000      # USDT
 
 parameters:
-  pair: null                  # e.g. [ETH, BTC] = long/short ETH against BTC, set in 02_pair_selection
+  pair: [ETH, BTC]            # PLACEHOLDER: trade A against B, i.e. [ETH, BTC]; decide in 02_pair_selection
   hedge_window: 720           # bars for rolling hedge ratio; null = static beta from train (set in 03a)
   zscore_lookback: 168        # bars for rolling z-score (placeholder, set in 03b)
   entry_z: 2.0                # open when |z| > entry_z (set in 03b)

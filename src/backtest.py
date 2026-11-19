@@ -441,3 +441,12 @@ def sweep(
         result = run_strategy(prices, funding, pair, params, period=period)
         rows.append({**dict(zip(names, values)), **{m: result.metrics[m] for m in SWEEP_METRICS}})
     return pd.DataFrame(rows)
+
+
+def compare_metrics(results: dict) -> pd.DataFrame:
+    """Put the metrics of several runs side by side (one column per run), e.g. train vs test.
+
+    Input:  dict of label -> Result.
+    Output: DataFrame, one row per metric, one column per run.
+    """
+    return pd.DataFrame({label: res.metrics for label, res in results.items()})
