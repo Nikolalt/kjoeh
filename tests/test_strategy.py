@@ -155,6 +155,34 @@ def test_equal_risk_sizes():
     assert flat["A"] == flat["B"] == pytest.approx(0.5)
 
 
+def test_pair_sizes_correlation_weighting():
+    """correlation: size ~ corr_btc; corr_risk: size ~ corr_btc / ratio_vol; negative corr gets 0; cap holds."""
+    vol = pd.Series({"A": 0.5, "B": 1.0, "C": 1.0})
+    corr = pd.Series({"A": 0.4, "B": 0.8, "C": -0.2})
+    by_corr = strategy.pair_sizes(vol, corr, 2.0, "correlation")
+    assert by_corr["B"] == pytest.approx(2 * by_corr["A"])
+    assert by_corr["C"] == 0.0
+    assert 2 * by_corr.sum() == pytest.approx(2.0)
+    both = strategy.pair_sizes(vol, corr, 2.0, "corr_risk")
+    assert both["A"] == pytest.approx(both["B"])  # 0.4 / 0.5 == 0.8 / 1.0
+    assert 2 * both.sum() == pytest.approx(2.0)
+    with pytest.raises(ValueError):
+        strategy.pair_sizes(vol, None, 2.0, "correlation")
+
+
+def test_pair_sizes_correlation_and_sharpe():
+    """corr_sharpe: size ~ corr_btc * max(sharpe, 0); a pair with negative train Sharpe gets 0; cap holds."""
+    vol = pd.Series({"A": 0.5, "B": 1.0, "C": 1.0})
+    corr = pd.Series({"A": 0.4, "B": 0.8, "C": 0.6})
+    sharpe = pd.Series({"A": 0.6, "B": 0.15, "C": -0.3})
+    sizes = strategy.pair_sizes(vol, corr, 2.0, "corr_sharpe", sharpe=sharpe)
+    assert sizes["A"] == pytest.approx(2 * sizes["B"])  # 0.4 * 0.6 = 2 * (0.8 * 0.15)
+    assert sizes["C"] == 0.0
+    assert 2 * sizes.sum() == pytest.approx(2.0)
+    with pytest.raises(ValueError):
+        strategy.pair_sizes(vol, corr, 2.0, "corr_sharpe")
+
+
 def test_apply_risk_stop_loss_and_take_profit_on_spread():
     """A short spread is stopped when the spread rises more than stop_loss since entry, and a long one
     takes profit when it rises more than take_profit; z alone (below stop_z) would not close either."""

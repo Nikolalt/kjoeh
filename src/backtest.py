@@ -208,15 +208,24 @@ def calibrate_pairs(cfg: dict, prices: pd.DataFrame, params: dict | None = None)
 
     Input:  config dict, full price DataFrame (all dates; only rows before train_end are used),
             optional parameter overrides.
-    Output: strategy.pair_diagnostics table plus a column size (per-leg fraction of capital).
+    Output: strategy.pair_diagnostics table plus a column size (per-leg fraction of capital). For
+            sizing sharpe / corr_sharpe also a column sharpe_train: each pair backtested alone on train
+            with equal-risk sizes (Sharpe does not depend on the size, as there is no compounding).
     """
     p = _params(cfg, params)
     train, _ = data.split_train_test(prices, cfg["setup"]["train_end"])
     diag = strategy.pair_diagnostics(
         train, p["zscore_lookback"], p["zscore_method"], data.coin_name(cfg["setup"]["numeraire"])
     )
-    diag["size"] = strategy.equal_risk_sizes(
-        diag["ratio_vol"], p["max_gross_leverage"], equal_capital=p["sizing"] == "equal_capital"
+    sharpe = None
+    if p["sizing"] in strategy.NEEDS_SHARPE:
+        base = diag.assign(size=strategy.pair_sizes(diag["ratio_vol"], None, p["max_gross_leverage"], "equal_risk"))
+        sharpe = pd.Series(
+            {alt: run_ratio_pair(cfg, prices, alt, "train", params, base).metrics["sharpe"] for alt in diag.index}
+        )
+        diag["sharpe_train"] = sharpe
+    diag["size"] = strategy.pair_sizes(
+        diag["ratio_vol"], diag["corr_btc"], p["max_gross_leverage"], p["sizing"], sharpe=sharpe
     )
     return diag
 

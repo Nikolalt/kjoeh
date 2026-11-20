@@ -205,6 +205,10 @@ def apply_risk(
     return position
 
 
+SIZING_METHODS = ("equal_capital", "equal_risk", "correlation", "corr_risk", "sharpe", "corr_sharpe")
+NEEDS_SHARPE = ("sharpe", "corr_sharpe")
+
+
 def equal_risk_sizes(ratio_vol: pd.Series, max_gross_leverage: float, equal_capital: bool = False) -> pd.Series:
     """Size of each pair (per leg, as a fraction of capital) so every pair carries the same risk.
 
@@ -215,7 +219,57 @@ def equal_risk_sizes(ratio_vol: pd.Series, max_gross_leverage: float, equal_capi
             gross leverage cap, equal_capital flag (same size for every pair instead).
     Output: Series of per-leg sizes indexed by alt.
     """
-    raw = pd.Series(1.0, index=ratio_vol.index) if equal_capital else 1.0 / ratio_vol
+    method = "equal_capital" if equal_capital else "equal_risk"
+    return pair_sizes(ratio_vol, None, max_gross_leverage, method)
+
+
+def pair_sizes(
+    ratio_vol: pd.Series,
+    corr_btc: pd.Series | None,
+    max_gross_leverage: float,
+    method: str = "equal_risk",
+    sharpe: pd.Series | None = None,
+) -> pd.Series:
+    """Size of each pair (per leg, as a fraction of capital), weighted by risk, correlation with BTC
+    and/or the pair's own train Sharpe.
+
+    Raw weight per alt, then scaled so that with all pairs open sum_i 2 * size_i = max_gross_leverage:
+        equal_capital  1
+        equal_risk     1 / ratio_vol                 (wilder ratios get less)
+        correlation    corr_btc                      (alts that move more with BTC get more: the BTC leg
+                                                      hedges them better, so less of the trade is
+                                                      unhedged alt-specific risk)
+        corr_risk      corr_btc / ratio_vol          (both)
+        sharpe         max(sharpe, 0)                (pairs that made money on train get more)
+        corr_sharpe    corr_btc * max(sharpe, 0)     (correlation and Sharpe together)
+    Negative correlations and Sharpes are floored at 0, so those pairs get no position. Use train
+    data only. Sharpe weighting picks pairs by their own past backtest, which tends to overfit.
+
+    Input:  annualised ratio volatility per alt, correlation of daily returns with BTC per alt
+            (both from pair_diagnostics(train); corr_btc may be None for the first two methods),
+            gross leverage cap, sizing method, per-pair train Sharpe (needed for sharpe / corr_sharpe).
+    Output: Series of per-leg sizes indexed by alt.
+    """
+    if method not in SIZING_METHODS:
+        raise ValueError(f"sizing must be one of {SIZING_METHODS}, got {method!r}")
+    if method in ("correlation", "corr_risk", "corr_sharpe"):
+        if corr_btc is None:
+            raise ValueError(f"sizing {method!r} needs corr_btc")
+        corr = corr_btc.reindex(ratio_vol.index).clip(lower=0.0)
+    if method in NEEDS_SHARPE:
+        if sharpe is None:
+            raise ValueError(f"sizing {method!r} needs sharpe")
+        sr = sharpe.reindex(ratio_vol.index).clip(lower=0.0)
+    raw = {
+        "equal_capital": lambda: pd.Series(1.0, index=ratio_vol.index),
+        "equal_risk": lambda: 1.0 / ratio_vol,
+        "correlation": lambda: corr,
+        "corr_risk": lambda: corr / ratio_vol,
+        "sharpe": lambda: sr,
+        "corr_sharpe": lambda: corr * sr,
+    }[method]().astype(float)
+    if raw.sum() <= 0:
+        raise ValueError("all sizing weights are zero")
     return raw / raw.sum() * max_gross_leverage / 2
 
 

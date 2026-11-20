@@ -51,5 +51,5 @@ parameters:
   take_profit: null           # off: the mean is the profit target
   time_stop_halflives: 3      # time stop: close after N half-lives (half-life per pair, train only)
   max_holding_days: 60        # hard cap on holding time, also used when the half-life is undefined
-  sizing: equal_risk          # equal_risk (size ~ 1 / train ratio vol) or equal_capital
+  sizing: equal_risk          # equal_risk (~ 1/ratio_vol), equal_capital, correlation (~ corr_btc), corr_risk (~ corr_btc/ratio_vol), sharpe or corr_sharpe (~ corr_btc * train pair Sharpe, overfits: test -74% drawdown)
   max_gross_leverage: 2.0     # sum of |alt leg| + |BTC leg| over all pairs when all are open
