@@ -444,7 +444,7 @@ re-enter the same runaway move on the next hour and lose again.
 
 At the very end of the data, any open trade is closed (`end_of_data`) so its costs are counted.
 
-Why these numbers (2.5, 0, 3.5, 168)? They were chosen on train data in the calibration (section 12). The general
+Why these numbers? 2.5 was chosen on train data (section 12). The others were set by judgment. The general
 trade-off: a lower entry threshold gives more trades, each with less profit and the same costs; a higher one gives
 fewer but better trades, and too few to judge.
 
