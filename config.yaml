@@ -1,48 +1,20 @@
-# =============================================================================
-# config.yaml: single source of truth for the project
-#
-#   setup:       fixed choices, set once before any analysis
-#   parameters:  decided in notebooks 02/03 on TRAIN data only
-#                notebook 04 only reads them and decides nothing
-# =============================================================================
+# All settings of the project in one place.
 
-setup:
-  exchange: binanceusdm       # ccxt id: Binance USDⓈ-M perpetual futures (fallback: okx, bybit)
-  universe:                   # base coins; data.py maps them to perpetuals, e.g. BTC -> BTC/USDT:USDT
-    - BTC
-    - ETH
-    - SOL
-    - BNB
-    - XRP
-    - ADA
-    - AVAX
-    - LINK
-    - DOT
-    - LTC
-    - DOGE
-    - TRX
-  timeframe: 1h
-  start: "2023-01-01"
-  train_end: "2025-12-31"     # dates are whole days, inclusive:
-  end: "2026-10-31"           # train = [start, train_end], test = (train_end, end]
-  max_ffill_bars: 3           # forward-fill price gaps up to this many bars, longer gaps stay NaN
-  max_missing_pct: 0.05       # drop a coin if more than this share of hourly bars is missing
-  fee_per_leg: 0.0005         # 5 bps per leg: Binance USDⓈ-M taker fee, regular user (VIP 0)
-  slippage_per_leg: 0.0002    # 2 bps per leg: assumed price impact / half spread per trade
-  initial_capital: 10000      # USDT
+# --- Data ---
+universe: [BTC, ETH, SOL, BNB, XRP, ADA, AVAX, LINK, DOT, LTC, DOGE, TRX]   # Binance USDT perpetuals
+start: "2023-01-01"
+train_end: "2025-12-31"   # train = start .. train_end, test = everything after
+end: "2026-10-31"
 
-parameters:
-  pair: [ETH, BTC]            # PLACEHOLDER: trade A against B, i.e. [ETH, BTC]; decide in 02_pair_selection
-  resample: 1h                # bar length for the strategy: 1h, 4h or 1D (set in 03, section 0)
-  hedge_window: 720           # hours for rolling hedge ratio; null = static beta from train (set in 03a)
-  zscore_lookback: 168        # hours for rolling z-score (placeholder, set in 03b)
-  entry_z: 2.0                # open when |z| > entry_z (set in 03b)
-  exit_z: 0.0                 # close when z is back within exit_z of the mean (set in 03b)
-  stop_z: 3.5                 # z-stop: close when |z| > stop_z; null = off (set in 03c)
-  time_stop_hours: 168        # time stop: close a trade after this many hours; null = off (set in 03c)
-  use_coint_filter: false     # block entries while the rolling cointegration p-value is high (03c)
-  coint_window: 2160          # hours (90 days) for the rolling cointegration test
-  coint_step: 24              # recompute the rolling p-value every 24 hours
-  coint_max_pvalue: 0.2       # entries allowed only while the rolling p-value <= this
-  position_size: 1.0          # fraction of capital per trade, gross across both legs
-  use_funding: true           # include funding payments (false only for the robustness check in 04)
+# --- Costs (per leg, per trade, as a fraction of the traded amount) ---
+fee: 0.0005               # 0.05% Binance futures taker fee
+slippage: 0.0002          # 0.02% assumed price impact
+
+# --- Strategy (chosen in the notebook on TRAIN data only) ---
+pair: [ETH, BNB]          # trade A against B: spread = log(A) - beta * log(B)
+hedge_window: 720         # hours of data for the rolling hedge ratio beta (720 h = 30 days)
+zscore_lookback: 336      # hours for the rolling mean / std of the spread (336 h = 2 weeks)
+entry_z: 2.5              # open a trade when |z| > entry_z
+exit_z: 0.0               # close it when z is back at the mean
+stop_z: 3.5               # stop loss: close when |z| > stop_z
+time_stop_hours: 168      # time stop: close a trade after this many hours

@@ -1,0 +1,550 @@
+# The whole project, explained from zero
+
+This document assumes you know nothing about markets, crypto or statistics beyond school maths. It goes in the
+same order as the notebook `notebooks/pairs_trading.ipynb`. Each part explains the idea first, then shows where
+it happens in the code.
+
+**Contents**
+1. Markets basics: prices, returns, long, short
+2. Crypto and perpetual futures (and why we need funding)
+3. The idea of pairs trading
+4. Statistics you need: regression, stationarity, ADF test, p-values
+5. Choosing the pair: Engle-Granger, multiple testing, half-life
+6. The spread and the hedge ratio
+7. The z-score: why it is calculated like that
+8. Trading rules: entry, exit, stops
+9. The backtest: how we compute profit and loss
+10. Costs: fees, slippage, funding
+11. Metrics: Sharpe, drawdown and friends
+12. Train / test split and overfitting
+13. Our results, and what they mean
+14. A complete example trade with real numbers
+15. Glossary
+
+---
+
+## 1. Markets basics
+
+### Price and return
+A **price** is what you pay for one unit of something, e.g. 1 ETH = 1,400 USDT.
+A **return** is how much the price changed, in percent:
+
+```
+return = new price / old price − 1
+1,400 → 1,456  gives a return of 1,456 / 1,400 − 1 = +4%
+```
+
+We care about returns, not price changes in dollars. Gaining $10 on a $100 coin is a lot; gaining $10 on a $50,000 coin is nothing.
+
+### Long and short
+- **Long** = you buy. You profit when the price goes **up**.
+- **Short** = you borrow the coin and sell it now, then buy it back later to return it. You profit when the price goes **down**.
+  Sold at 100, bought back at 90 → +10.
+
+Pairs trading always does both at the same time: long one coin, short another.
+
+### Log prices
+We often use the natural logarithm of the price, `log(price)`, for three reasons:
+1. A difference of log prices is (almost exactly) a percentage return: `log(1,456) − log(1,400) ≈ 0.039 ≈ 3.9%`.
+2. Equal percentage moves look equal. On a log chart, 100 → 200 and 1,000 → 2,000 are the same height.
+3. A regression on log prices gives a hedge ratio in percent terms (section 6).
+
+Typical values in our data: log(ETH price) ≈ 7.1 to 8.5, log(BNB price) ≈ 5.3 to 7.2.
+
+### Hourly candles
+The exchange summarises trading in **candles**: for each hour, the open, high, low and close price and the volume.
+We only use the **close**. A candle is labelled by its start time: the candle "07:00" covers 07:00–08:00, and its
+close is the price at 08:00. That matters for the timing in the backtest (section 9).
+
+---
+
+## 2. Crypto and perpetual futures
+
+### The coins
+We use 12 large, liquid coins (BTC, ETH, SOL, BNB, XRP, ADA, AVAX, LINK, DOT, LTC, DOGE, TRX), all priced in
+**USDT**. USDT is a "stablecoin" worth about 1 US dollar. "Liquid" means lots of trading, so we can buy and sell
+quickly without moving the price.
+
+Our pair:
+- **ETH** (Ether): the coin of Ethereum, the biggest "smart-contract" blockchain (a platform for running programs and apps).
+- **BNB**: the coin of BNB Chain, a competing smart-contract blockchain run by the Binance ecosystem.
+
+Both are bets on the same industry, so their prices tend to move together. That is the economic reason we
+expect a relationship between them.
+
+### Why perpetual futures and not the coins themselves?
+To short a coin you must borrow it, which is awkward and expensive on normal ("spot") crypto markets. Exchanges
+offer **perpetual futures** ("perps") instead. A perp is a contract that tracks the coin's price, and you can go
+long or short with one click. Profit and loss is settled in USDT. That is why we trade Binance USDⓈ-M perpetuals
+(USDⓈ-M = margined in USDT).
+
+### Funding: why it exists
+A normal futures contract has an expiry date, and on that date it is settled at the real coin price, so it can't
+drift away from it. A **perpetual never expires**. So what stops its price from drifting away from the real coin
+price? The **funding rate**:
+
+- Every 8 hours (00:00, 08:00, 16:00 UTC) the two sides of the contract pay each other a small amount.
+- If the perp trades **above** the spot price (too many buyers), the rate is **positive**: **longs pay shorts**.
+  That makes being long more expensive and pulls the price back down.
+- If it trades **below**, the rate is **negative**: **shorts pay longs**.
+- Typical size: 0.01% per 8 hours. Small, but about 11% per year if it stays like that.
+
+### Why we need funding in the backtest
+Because we really hold perps, funding is a real cash flow that hits our account. Leaving it out would make the
+results too optimistic (or too pessimistic). Over our train period the average funding was:
+- ETH: **+8.7% per year**, so being long ETH costs money.
+- BNB: **−4.6% per year** (negative), so being short BNB *also* costs money, because shorts pay longs.
+
+So a "long the spread" trade (long ETH, short BNB) pays funding on both legs. A "short the spread" trade (short ETH,
+long BNB) receives on both. On train we had 51 long-spread and 50 short-spread trades: the long ones paid 3.5% in
+funding and the short ones received 3.3%. In total funding came out at about −0.1%, which is small, but we only
+know that because we included it.
+
+Code: funding is loaded in `data.load_data` and applied in `strategy.backtest` (the `fund = ...` line).
+
+---
+
+## 3. The idea of pairs trading
+
+Imagine two coins that usually move together, like two ships tied with an elastic rope. Sometimes one ship drifts
+ahead, but the rope pulls them back together.
+
+- When ETH is **unusually expensive** compared with BNB: **short ETH, buy BNB**. When the gap closes, we earn money
+  whether both rise or both fall.
+- When ETH is **unusually cheap** compared with BNB: **buy ETH, short BNB**.
+
+This is called **statistical arbitrage**, or "stat arb". It is **market neutral**: if the whole crypto market
+crashes 20%, both coins fall, and our long loss is roughly offset by our short gain. We only bet on the
+*relative* price.
+
+To turn this into a strategy we have to answer four questions:
+1. Which two coins? → **pair selection** (sections 4–5)
+2. How do we measure "the gap"? → **spread with a hedge ratio** (section 6)
+3. When is the gap "unusually" large? → **z-score** (section 7)
+4. When do we get out, including when it goes wrong? → **trading rules** (section 8)
+
+---
+
+## 4. The statistics you need
+
+### Linear regression (OLS)
+You have points (x, y) and you fit the best straight line `y = alpha + beta · x`. "Best" means the sum of squared
+vertical distances from the points to the line is as small as possible. That is called Ordinary Least Squares (OLS).
+- **beta** = slope: if x goes up by 1, y goes up by beta on average.
+- **alpha** = intercept: where the line crosses x = 0.
+- **residual** = actual y − value on the line, i.e. how far each point is from the line.
+
+A useful formula: `beta = cov(x, y) / var(x)`. Covariance measures how much x and y move together; variance
+measures how much x moves on its own. Our code uses this formula for the rolling beta.
+
+### Stationary vs non-stationary
+This is the most important concept in the project.
+- A **stationary** series keeps coming back to the same average and has a stable spread around it. Example: the
+  temperature in January in Hong Kong. It wiggles, but it doesn't wander off to 50 °C.
+- A **non-stationary** series can wander anywhere and has no average it returns to. Example: a coin price. It went
+  from 1,200 to 4,800 and nothing pulls it back. The classic model is a **random walk**: each step is random, so
+  the best guess for tomorrow is today's value.
+
+Prices are non-stationary. You can't trade "the price will return to its mean" on one price, because there is no
+mean to return to. **But** a combination of two prices can be stationary, and that is what we look for.
+
+The jargon: a non-stationary price whose changes (returns) are stationary is called **I(1)**, "integrated of order 1".
+A stationary series is **I(0)**.
+
+### Hypothesis tests and p-values
+A statistical test starts from a **null hypothesis** (the "boring" assumption) and asks: *if the boring assumption
+were true, how likely would data this extreme be?* That probability is the **p-value**.
+- Small p-value (e.g. < 0.05): the data would be very unusual under the boring assumption, so we **reject** it.
+- Large p-value: the data is compatible with the boring assumption, and we can't reject it.
+
+A p-value of 0.05 means: even if nothing is going on, you would see a result like this 5% of the time by luck.
+
+### The ADF test (Augmented Dickey-Fuller)
+It tests whether a series is stationary.
+- Null hypothesis: the series is a random walk (**non**-stationary).
+- Idea: regress the change of the series on its previous level: `change(t) = c + phi · level(t−1) + ...`.
+  If phi is clearly negative, then whenever the level is high the next change tends to be down, and vice versa.
+  So the series is pulled back to a mean, i.e. it is stationary.
+- "Augmented" means it also includes past changes in the regression, to soak up short-term patterns. We allow up
+  to 24 of them (`maxlag=24`, one day of hourly data).
+- Low p-value → reject "random walk" → stationary.
+
+---
+
+## 5. Choosing the pair (`strategy.rank_pairs`)
+
+### Correlation is not enough
+**Correlation** (−1 to +1) measures whether two series move together. We compute it on **hourly returns**. Not on
+prices: any two prices that both trended upward look highly "correlated" even if they are unrelated. That is called
+spurious correlation.
+
+But even a high return correlation doesn't mean the prices stay together. Two coins can move in the same direction
+every hour, with one moving a bit more each time, and drift apart forever. Correlation is about *short-term
+co-movement*; we need a *long-term tie*. That tie is **cointegration**.
+
+### Cointegration
+Two non-stationary prices A and B are **cointegrated** if some combination `log(A) − beta · log(B)` **is stationary**.
+In plain words: each price wanders around freely, but they wander *together*, and the gap between them keeps coming
+back. That gap is exactly what we want to trade.
+
+### The Engle-Granger test (the method we use)
+A two-step recipe, named after the two economists who got a Nobel prize partly for it:
+1. **Regression:** `log(A) = alpha + beta · log(B) + residual`. The residual is the spread.
+2. **ADF test on the residual:** is the spread stationary? A low p-value means cointegrated.
+
+One subtlety: in step 1, OLS chooses beta to make the residual as small and as stationary-looking as possible. So a
+normal ADF test would be too optimistic. Engle-Granger therefore uses stricter critical values (MacKinnon's), so
+the p-value is fair. `statsmodels.coint()` does all of this in one call.
+
+### The checks we add
+In `rank_pairs` every pair gets these columns:
+
+| Column | Meaning | What we want |
+|---|---|---|
+| `correlation` | correlation of hourly returns | high (> 0.6) |
+| `p_value` | Engle-Granger p-value | low |
+| `p_bonferroni` | p-value × 66 (see below) | < 0.05 would be convincing |
+| `beta` | hedge ratio from the regression | positive, sensible |
+| `half_life_h` | hours for the spread to close half the gap | not too long |
+| `adf_p_a`, `adf_p_b` | ADF p-value of each coin **alone** | **high** (each coin should be a random walk) |
+
+**Multiple testing (Bonferroni).** 12 coins give 12·11/2 = 66 pairs, so we run 66 tests. With a 5% threshold, about
+66 × 0.05 ≈ 3 pairs would look "significant" **by pure luck**, even if no pair were really cointegrated. It's like
+flipping 66 coins: some will land heads five times in a row. The Bonferroni correction multiplies each p-value by
+the number of tests. It is crude and conservative, but it makes the point: our best p-value of 0.014 becomes 0.91,
+i.e. not significant at all.
+
+**Single-leg stationarity check.** Engle-Granger assumes both coins are random walks on their own. If one coin
+alone is already stationary (e.g. it moved sideways in a range the whole time), the regression finds a tiny beta,
+the "spread" is basically that one coin, and the test says "cointegrated" although the other coin adds nothing.
+In our data, **LTC** alone has an ADF p-value of 0.01, so it is stationary on its own, and the top two pairs
+(LTC/DOGE, LTC/TRX) are fake for this reason.
+
+**Half-life** (`strategy.half_life`). It answers: if the spread is away from its mean, how long until half the gap
+is gone? We fit `change(t) = c + phi · spread(t−1)` (the same regression as in ADF). Each hour, a share phi of the
+gap disappears, so after n hours `(1 + phi)^n` of it is left. Setting that to ½ gives
+
+```
+half-life = ln(2) / −ln(1 + phi)
+```
+
+Example: phi = −0.1 → 10% of the gap closes per hour → half-life ≈ 6.6 hours. If phi ≥ 0 there is no pull back, so
+the half-life is infinite. Our pairs have half-lives of weeks over the full train period, which tells us the
+relationship is slow and loose.
+
+### What we found, and how we chose
+- No pair is significantly cointegrated after the correction.
+- So the statistics alone don't pick a winner. We then **backtested a few liquid, economically related candidates**
+  on train data (section 12) and picked **ETH/BNB**: same industry, return correlation 0.71, neither leg stationary
+  alone, the best region of train results, and smaller drawdowns than the alternative ADA/DOGE.
+
+---
+
+## 6. The spread and the hedge ratio (`strategy.spread_and_zscore`)
+
+### Why not just log(ETH) − log(BNB)?
+Because the two coins don't move one-for-one. If BNB typically moves 1% and ETH moves 0.8% at the same time, you
+need a ratio. That ratio is the **hedge ratio beta**, the slope of the regression of log(ETH) on log(BNB):
+
+```
+log(ETH) ≈ alpha + beta · log(BNB)
+spread   = log(ETH) − beta · log(BNB) − alpha
+```
+
+Because we use logs, beta means: "BNB +1% → ETH +beta% on average".
+
+### Why rolling?
+The relationship isn't constant: over three years the full-period regression doesn't even pass the cointegration
+test. So we **re-estimate beta every hour using only the last 720 hours (30 days)**. This is a **rolling window**:
+at each hour, look back 30 days, compute, move on. It uses only past data, so there is no peeking into the future.
+
+```python
+beta  = log_a.rolling(720).cov(log_b) / log_b.rolling(720).var()       # slope = cov / var
+alpha = log_a.rolling(720).mean() - beta * log_b.rolling(720).mean()   # intercept
+```
+
+(These are exactly the OLS formulas, computed for every 30-day window at once.)
+
+Our rolling beta is about 1 on average, but it moves a lot (25% of the time below 0.62, 25% above 1.37). That is a
+weakness worth knowing: the relationship is unstable.
+
+### Why the alpha (intercept)?
+log(BNB) is about 6. If beta changes from 1.00 to 1.01 between two hours, `beta · log(BNB)` changes by 0.06. That's
+a 6% jump in the spread from a tiny change in the estimate, not from the market. Subtracting the matching rolling
+alpha keeps the spread centred around 0, so it only moves when the prices really move relative to each other.
+
+---
+
+## 7. The z-score (`strategy.spread_and_zscore`)
+
+```python
+z = (spread − rolling mean of spread) / rolling standard deviation of spread    # over the last 336 hours
+```
+
+### Why do we need it at all?
+The spread is a number like 0.03 or −0.05. Is 0.03 "a lot"? That depends on how much the spread normally moves.
+In a calm month 0.03 could be extreme; in a wild month it could be nothing. The z-score translates the spread into
+**"how many typical deviations are we away from normal?"**:
+- z = 0: the spread is at its normal level.
+- z = +2.5: the spread is 2.5 standard deviations **above** normal, so ETH is unusually expensive compared with BNB.
+- z = −2.5: ETH is unusually cheap.
+
+That gives us one rule that works in calm and wild periods alike: "trade when |z| > 2.5".
+
+For a rough feel: if the spread were normally distributed, |z| > 2.5 would happen only about 1.2% of the time.
+Crypto has fat tails (extreme moves happen more often than a normal distribution says), so in practice it is more often.
+
+### Why subtract a rolling mean, and why 336 hours?
+- **Rolling mean:** the "normal level" of the spread drifts over time, so we compare it with its own recent past
+  (the last 2 weeks), not with a fixed number.
+- **Rolling standard deviation:** volatility changes too, so "a typical deviation" is measured over the same 2 weeks.
+- **Why 2 weeks and not 1 day?** The window must be **long compared with how long a deviation takes to revert**.
+  If it's too short, the mean simply follows the spread: when the spread moves away, the mean follows it within
+  hours, z never gets large, and we trade noise and pay costs. If it's too long, the mean is stale and z stays on one
+  side for weeks. In calibration, short windows (168 h) lost money for almost every pair; 336 h worked best.
+
+### No lookahead
+Every rolling value at hour t uses only the hours up to and including t. The z-score at 14:00 is known at 14:00.
+
+---
+
+## 8. Trading rules (`strategy.positions`)
+
+The function walks through the z-score **hour by hour** and keeps a state: flat (0), long the spread (+1) or short
+the spread (−1). At the close of each hour it decides:
+
+**When flat (entry):**
+- z < −2.5 → **+1, long the spread** = buy ETH, short BNB (ETH is cheap, so we expect the spread to rise back to 0).
+- z > +2.5 → **−1, short the spread** = short ETH, buy BNB.
+- But not if |z| > 3.5 already, because we would be stopped out at once and only pay fees.
+
+**When in a trade (exit), checked in this order:**
+1. **Stop loss**, |z| > 3.5: the gap keeps widening. Maybe the relationship broke (e.g. news about one coin).
+   We cut the loss instead of hoping.
+2. **Time stop**, open for 168 hours (one week): the gap isn't closing in a reasonable time. Capital stuck in a
+   dead trade can't be used elsewhere.
+3. **Take profit**, z is back at the mean (exit_z = 0): long trades close when z ≥ 0, short trades when z ≤ 0.
+   This is the normal, winning exit.
+
+**Cooldown after a stop.** After a stop or time stop we don't trade again until |z| < 2.5. Otherwise we would
+re-enter the same runaway move on the next hour and lose again.
+
+At the very end of the data, any open trade is closed (`end_of_data`) so its costs are counted.
+
+Why these numbers (2.5, 0, 3.5, 168)? They were chosen on train data in the calibration (section 12). The general
+trade-off: a lower entry threshold gives more trades, each with less profit and the same costs; a higher one gives
+fewer but better trades, and too few to judge.
+
+---
+
+## 9. The backtest (`strategy.backtest`)
+
+A **backtest** simulates "what would have happened if we had traded these rules in the past".
+
+### How much of each coin? (position sizing)
+We always use all our capital, split between the two legs in the ratio 1 : beta:
+
+```
+weight ETH =  1    / (1 + |beta|)      (long, for position +1)
+weight BNB = −beta / (1 + |beta|)      (short)
+```
+
+With beta = 0.8: 56% of capital long ETH and 44% short BNB. Why 1 : beta? If BNB moves 1%, ETH moves about beta%.
+So $1 of ETH changes by $beta·1%, and $beta of BNB also changes by $beta·1%, which cancels exactly. That is what
+"hedged" means: the common movement cancels and only the *relative* movement (the spread) is left.
+
+We **freeze beta at entry** for the whole trade. We bought fixed amounts at the start, and the hedge doesn't
+change just because the rolling estimate changes.
+
+### Timing: no lookahead
+The most common way to cheat by accident in a backtest is to use information you didn't have yet. Our rule:
+**the position decided at the close of hour t earns the return of hour t+1.** In code:
+
+```python
+held = pos.shift(1)    # the position we actually hold DURING each hour = decided one hour earlier
+```
+
+Example: z crosses −2.5 at the 14:00 close. We buy at that close price, and our first profit or loss comes from the
+next hour's price move. We never earn the move that caused the signal.
+
+### Profit and loss per hour
+For each hour t (as fractions of our capital):
+
+```
+gross   = held × (weight_ETH × return_ETH + weight_BNB × return_BNB)
+costs   = (fee + slippage) × |change of position|           only in hours where we trade
+funding = −held × (weight_ETH × rate_ETH + weight_BNB × rate_BNB)
+net     = gross − costs + funding
+equity  = (1 + net_1) × (1 + net_2) × ...                 start = 1, i.e. 100% of our capital
+```
+
+The funding sign: if the rate is positive and we are long (positive weight), we pay, so there is a minus sign. If we
+are short (negative weight), the minus signs cancel and we receive.
+
+Funding timing: the payment stamped 08:00 is paid by whoever holds a position at 08:00, i.e. the position held during
+the 07:00–08:00 candle. That's why the code uses `funding.shift(-1)`.
+
+Equity **compounds**: profits are reinvested, so +1% then +1% gives +2.01%.
+
+### Where the z-score is computed
+The z-score is computed on the **full history** first, then cut to the train or test period. That isn't cheating:
+rolling values only look backwards. It means the test period (starting 1 Jan 2026) begins with a z-score that is
+already "warmed up" from December 2025 data, as it would be in real life.
+
+### Trades table (`strategy.list_trades`)
+It groups the hours into trades: entry time, exit time, direction, z at entry and exit, return of the trade
+(compounded net, including both trading costs), and why it was closed.
+
+---
+
+## 10. Costs
+
+Every trade costs money. Ignoring this is the most common reason backtests look great and real trading doesn't.
+
+- **Fee: 0.05% per leg.** Binance charges this on the traded amount when you take an existing offer (a "taker" order).
+- **Slippage: 0.02% per leg.** You don't get exactly the last price: buying pushes the price up a bit and there is a
+  gap between the buy and sell price (the "spread" of the order book, not our spread). We assume a fixed 0.02%.
+- One trade = open both legs, close both legs. Because we trade all our capital, opening costs
+  (0.05% + 0.02%) × 100% of capital = 0.07%, and closing costs the same: **about 0.14% per round trip.**
+
+So a trade must earn more than 0.14% just to break even. On train, costs ate about a quarter of the gross profit; on
+test about half.
+
+---
+
+## 11. Metrics (`strategy.metrics`)
+
+| Metric | What it means |
+|---|---|
+| **total_return** | equity at the end − 1. 0.44 = +44% |
+| **annual_return** | the return per year that would compound to the total: `equity^(1/years) − 1` |
+| **sharpe** | return per unit of risk: `mean(hourly return) / std(hourly return) × √8760`. Rough guide: < 0.5 weak, ~1 decent, > 2 very good (and suspicious in a backtest) |
+| **max_drawdown** | worst fall from a previous peak. −0.17 = at some point we were 17% below our best level so far. It measures the pain |
+| **n_trades** | number of round trips. Fewer than ~30 is too few to trust the other numbers |
+| **win_rate** | share of trades that made money |
+| **avg_trade_return** | average return per trade, after costs |
+| **avg_hours_in_trade** | how long a trade lasts on average |
+| **time_in_market** | share of hours with an open position |
+| **sum_gross / sum_costs / sum_funding** | where the profit came from and went to |
+
+Why × √8760 in the Sharpe? Crypto trades 24/7, so a year has 24 × 365 = 8,760 hours. Risk (standard deviation)
+grows with the square root of time, return grows linearly, so the ratio scales with √(hours per year).
+
+---
+
+## 12. Train / test split and overfitting
+
+### The split
+- **Train**: 2023-01-01 to 2025-12-31 (3 years). Used for every decision: pair, parameters, rules.
+- **Test**: 2026-01-01 to 2026-10-31 (10 months). Used **once**, at the very end, with everything fixed.
+
+Why? If you try many parameter combinations on the same data and keep the best, the "best" is partly luck: it fits
+the noise of that particular period. This is called **overfitting**. The test period is data the strategy has never
+seen, so it shows what you could actually expect. If you change parameters after looking at the test, it is no
+longer a fair test.
+
+### Calibration (notebook section 4)
+We backtested a grid on train: 6 candidate pairs × 3 hedge windows × 3 z-score lookbacks × 3 entry thresholds = 162
+backtests. What we look for is a **plateau, not a peak**: a region where a cell *and its neighbours* do well. A
+real effect shouldn't vanish when you change a window from 720 to 1,080 hours.
+
+What we found: most combinations lose money. ETH/BNB at 720 h / 336 h / 2.5 has a Sharpe of 0.82, but its
+neighbours are much worse. That's a peak, a warning sign for overfitting, and it predicted that the test would be
+weaker.
+
+### Risk rules
+- Stop loss: max drawdown −27% → −16%, and Sharpe goes up. Clearly useful.
+- Time stop: on train, the Sharpe is *lower* with it (0.82 vs 1.10 without). We kept it as a safety rule. A strict
+  train-only decision would have dropped it. We did not change it after seeing the test.
+
+---
+
+## 13. Our results, and what they mean
+
+| | Train (3 years) | Test (10 months) |
+|---|---|---|
+| Sharpe | 0.82 | 0.33 |
+| Total return | +44% | +2.6% |
+| Max drawdown | −17% | −9% |
+| Trades | 101 | 26 |
+| Win rate | 57% | 50% |
+
+How to read it:
+- The strategy **stays slightly positive out of sample**, but much weaker than in sample, as the overfitting warning predicted.
+- With 26 trades, a Sharpe of 0.33 is **not statistically distinguishable from zero**. We can't claim a proven edge.
+- **Costs matter:** with double fees the test return is 0.
+- **Funding barely matters** (about −0.1%), because long-spread and short-spread trades pay and receive in opposite directions and roughly cancel.
+- **Big picture:** crypto pairs are not reliably cointegrated, so classic pairs trading on one pair has a small, fragile edge.
+
+What would improve it: trade many pairs at once (more trades, more diversification, more reliable statistics),
+re-calibrate regularly on recent data (walk-forward), use cheaper maker orders, and stop trading when the
+relationship breaks down.
+
+### Simplifications we made (know these for the Q&A)
+- Leg weights are held constant during a trade. In reality we hold fixed coin amounts, so the weights drift slightly.
+- Fixed slippage, taker fees, no leverage or margin calls.
+- Only one pair.
+- Exits use the rolling z-score, not a z-score recomputed with the frozen entry beta.
+
+---
+
+## 14. A complete example trade (real numbers, train period)
+
+| Time (UTC, candle label) | ETH price | BNB price | beta | z | Position |
+|---|---|---|---|---|---|
+| 2023-03-10 13:00 | 1,423.83 | 274.11 | 0.788 | −2.48 | 0 (just above −2.5, no entry) |
+| 2023-03-10 14:00 | 1,400.76 | 271.66 | 0.794 | **−2.86** | **+1 → enter** |
+| 2023-03-10 15:00 | 1,416.42 | 274.35 | 0.800 | −2.64 | +1 (holding) |
+| ... 51 hours later ... | | | | | |
+| 2023-03-12 17:00 | | | | **+0.59** | **0 → take profit** |
+
+What happened:
+1. At the 14:00 close, z fell to −2.86, below −2.5: ETH was unusually cheap compared with BNB.
+2. We went **long the spread** with frozen beta 0.794: 1/1.794 = **56% of capital long ETH**, 0.794/1.794 =
+   **44% short BNB**. We paid 0.07% in costs.
+3. Over the next 51 hours ETH recovered relative to BNB, and the spread moved back up.
+4. At the 17:00 close on 12 March, z had crossed 0 (it was +0.59), so the take-profit rule closed the trade. We paid
+   another 0.07%.
+5. Result: **+3.06%** on our capital, after costs and funding.
+
+Not every trade goes like this. On 2023-03-03 a long trade was entered at z = −2.73, the gap kept widening, and the
+stop loss closed it at z = −4.40 for −4.1%.
+
+---
+
+## 15. Glossary
+
+| Term | Meaning |
+|---|---|
+| ADF test | Augmented Dickey-Fuller: tests whether a series is stationary |
+| alpha | intercept of the regression; centres the spread |
+| beta / hedge ratio | how many % ETH moves per 1% move in BNB; sets the size of the two legs |
+| backtest | simulation of the strategy on past data |
+| Bonferroni | multiply p-values by the number of tests, to correct for testing many pairs |
+| candle | open/high/low/close/volume summary of one hour |
+| cointegration | two wandering prices whose combination (the spread) does not wander |
+| correlation | how much two series move together, −1 to +1 |
+| drawdown | fall from the previous peak of the equity curve |
+| Engle-Granger | regression + ADF test on the residual = cointegration test |
+| equity | value of our account over time (start = 1) |
+| fat tails | extreme moves happen more often than a normal distribution predicts |
+| funding rate | payment between longs and shorts on a perpetual, every 8 h |
+| half-life | time for the spread to close half its gap to the mean |
+| I(0) / I(1) | stationary / random-walk-like (stationary after taking differences) |
+| lookahead bias | accidentally using future information in a backtest |
+| long / short | bet on price up / bet on price down |
+| market neutral | profit doesn't depend on the overall market direction |
+| OLS | ordinary least squares, the standard way to fit a regression line |
+| overfitting | choosing parameters that fit the noise of past data |
+| perpetual future (perp) | contract tracking a coin's price, no expiry, allows shorting |
+| p-value | probability of data this extreme if the null hypothesis were true |
+| rolling window | statistic computed over the last n hours, recomputed every hour |
+| Sharpe ratio | return per unit of volatility, annualised |
+| slippage | getting a worse price than expected when trading |
+| spread | log(ETH) − beta · log(BNB) − alpha: the gap we trade |
+| stationary | keeps returning to a stable mean with a stable spread around it |
+| stop loss | closing a losing trade at a predefined level |
+| taker fee | fee for an order that trades immediately against existing orders |
+| train / test | data for decisions / data for the final honest check |
+| USDT | stablecoin worth about 1 USD |
+| z-score | how many standard deviations the spread is from its recent mean |
