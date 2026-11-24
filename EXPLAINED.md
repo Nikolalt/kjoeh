@@ -267,7 +267,7 @@ A stationary series is **I(0)**.
 ### Hypothesis tests and p-values
 A statistical test starts from a **null hypothesis** (the "boring" assumption) and asks: *if the boring assumption
 were true, how likely would data this extreme be?* That probability is the **p-value**.
-- Small p-value (e.g. < 0.05): the data would be very unusual under the boring assumption, so we **reject** the boring assumption.
+- Small p-value (e.g. < 0.05): the data would be very unusual under the boring assumption, so we **reject** this assumption.
 - Large p-value: the data is compatible with the boring assumption, and we can't reject it.
 
 A p-value of 0.05 means: even if nothing is going on, you would see a result like this 5% of the time by luck.
