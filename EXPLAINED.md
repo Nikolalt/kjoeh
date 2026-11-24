@@ -5,6 +5,7 @@ same order as the notebook `notebooks/pairs_trading.ipynb`. Each part explains t
 it happens in the code.
 
 **Contents**
+0. **Interview answers: the 11 questions we may be asked, answered briefly** (read this last, as a summary)
 1. Markets basics: prices, returns, long, short
 2. Crypto and perpetual futures (and why we need funding)
 3. The idea of pairs trading
@@ -12,14 +13,126 @@ it happens in the code.
 5. Choosing the pair: Engle-Granger, multiple testing, half-life
 6. The spread and the hedge ratio
 7. The z-score: why it is calculated like that
-8. Trading rules: entry, exit, stops
+8. Trading rules: entry, exit, stops, trading frequency
 9. The backtest: how we compute profit and loss
 10. Costs: fees, slippage, funding
 11. Metrics: Sharpe, drawdown and friends
 12. Train / test split and overfitting
 13. Our results, and what they mean
-14. A complete example trade with real numbers
-15. Glossary
+14. Going through the trades (with real numbers)
+15. Challenges
+16. What we learned
+17. Glossary
+
+**Which code to look at before the Q&A** (in `src/strategy.py`, about 230 lines in total):
+- `rank_pairs`: pair selection (section 5)
+- `spread_and_zscore`: 15 lines, the indicators (sections 6–7)
+- `positions`: the trading rules, one loop (section 8)
+- `backtest`: profit and loss, about 40 lines (section 9)
+
+The notebook `notebooks/pairs_trading.ipynb` shows all tables and charts mentioned here.
+
+---
+
+## 0. Interview answers
+
+These are the questions from the interview brief, each with a short answer and where to read more. The grading
+gives 10% each to strategy design (the idea, **not** the PnL), risk management, documentation and our individual
+answers. A weak PnL explained honestly is fine; an idea we can't explain is not.
+
+**1. Objective, and how the strategy makes money**
+Market-neutral statistical arbitrage. ETH and BNB usually move together. When the gap between them (the spread) is
+unusually large, we buy the relatively cheap coin and short the relatively expensive one, and profit when the gap
+closes, whether the market goes up or down. → sections 3, 6, 7
+
+**2. Which products, and why**
+Binance USDT-margined perpetual futures on ETH and BNB.
+- Perpetuals, because we must short one leg, and that is easy and cheap with perps but awkward on spot.
+- Binance, because it is the most liquid exchange: low fees, tight prices, long clean history.
+- ETH/BNB: the native coins of the two largest smart-contract platforms, so they have an economic link. Return
+  correlation 0.71, neither coin is stationary on its own, and the best region in our train calibration with lower
+  drawdowns than the alternative.
+→ sections 2, 5
+
+**3. Trading frequency and time horizon**
+Hourly data and decisions. About 3 trades per month (101 trades in 3 years of train, 26 in the 10 test months). A
+trade lasts 2–3 days on average (median 58 h on train), at most 7 days because of the time stop. We are in a trade
+about 25% of the time. It's a short-term swing strategy, not high-frequency. → section 8
+
+**4. Data features and indicators**
+- Data: hourly close prices and funding rates for 12 coins, 2023-01 to 2026-10 (33,600 hours, no gaps).
+- Indicators, all rolling and backward-looking:
+  - hedge ratio beta over 30 days
+  - spread = log(ETH) − beta·log(BNB) − alpha
+  - z-score of the spread over 2 weeks
+- For pair selection: return correlation, Engle-Granger p-value, ADF p-value of each coin alone, half-life.
+→ sections 5, 6, 7
+
+**5. How entry and exit signals are generated**
+- Entry: z < −2.5 → long the spread (buy ETH, short BNB); z > +2.5 → short the spread. No entry if |z| > 3.5.
+- Exit:
+  - take profit when z is back at 0
+  - stop loss at |z| > 3.5
+  - time stop after 168 h
+- After a stop we wait until |z| < 2.5 before trading again.
+- Decisions happen at each hourly close, and we trade at that close price.
+→ section 8, code `positions()`
+
+**6. Position sizing and management**
+All capital, no leverage, split in the ratio 1 : beta. With beta = 0.8: 56% long ETH and 44% short BNB. This makes
+the position neutral to common moves of both coins. Beta is frozen at entry for the whole trade. Only one trade at a
+time; we never add to a position. → section 9
+
+**7. Risk management**
+- **Hedging:** long one coin, short the other, so market-wide moves mostly cancel (market neutral).
+- **Stop loss** at |z| > 3.5: limits losses when the relationship breaks. On train it cut the max drawdown from −27% to −16%.
+- **Time stop** after 7 days: capital is never stuck in a dead trade. Honest note: on train it lowered the Sharpe.
+- **Take profit** at z = 0: we take the profit as soon as the gap is closed instead of hoping for more.
+- **Cooldown after a stop:** no immediate re-entry into the same runaway move.
+- **No entry beyond the stop level**, no leverage, one trade at a time.
+- **Realistic costs:** fees, slippage and funding are included, so the risk isn't hidden by optimistic assumptions.
+→ sections 8, 12
+
+**8. Back-testing approach**
+- Bar-by-bar simulation on hourly data.
+- No lookahead: the position decided at the close of hour t earns only the return of hour t+1, and all indicators
+  use only past data.
+- Fees 0.05%, slippage 0.02% per leg, and real funding payments.
+- Train 2023–2025 for every decision, test Jan–Oct 2026 run once at the end.
+- Robustness checks: double fees, no funding.
+- Unit tests check the trading rules.
+→ sections 9, 10, 12
+
+**9. The PnL results**
+- Train: +44% in 3 years, Sharpe 0.82, max drawdown −17%.
+- Test: +2.6% in 10 months, Sharpe 0.33, max drawdown −9%.
+- The test equity peaked at about +9% in June 2026, then gave most of it back through stop losses.
+- Gross profit is reduced a lot by costs (a quarter on train, half on test). Funding is negligible.
+- The drop from train to test was expected: the chosen parameters were an isolated peak (overfitting risk).
+→ sections 13, 14
+
+**10. Go through the trade transactions**
+Take-profit trades make the money (+2.0% on average, 92% win rate on train); stop losses cost −1.8% on average.
+Know the best trade (+7.0%, Jan 2024) and the worst trade (−7.2%, Sep 2025). In both, beta was only about 0.1, so
+they were mostly ETH bets. Know the example trade (+3.1%, Mar 2023) as well. → section 14 and the notebook charts
+
+**11. What we learned**
+→ section 16. In short:
+- correlation is not cointegration
+- most "significant" pairs are luck or fake
+- costs decide whether an edge survives
+- a good backtest on train is not proof
+- a rolling hedge ratio needs safeguards
+- honest out-of-sample testing matters more than a high Sharpe
+
+**What makes the design ours (strategy design and creativity marks):**
+- an intercept in the rolling spread, so beta changes don't make the spread jump
+- beta frozen at entry
+- realistic funding modelling for perps, with correct timing
+- the single-leg stationarity check that exposed the fake LTC pairs
+- the Bonferroni correction for testing 66 pairs
+- a cooldown after stops
+- strict train/test discipline
 
 ---
 
@@ -335,6 +448,20 @@ Why these numbers (2.5, 0, 3.5, 168)? They were chosen on train data in the cali
 trade-off: a lower entry threshold gives more trades, each with less profit and the same costs; a higher one gives
 fewer but better trades, and too few to judge.
 
+### Trading frequency and time horizon
+
+| | Train (36 months) | Test (10 months) |
+|---|---|---|
+| Trades | 101 | 26 |
+| Trades per month | 2.8 | 2.6 |
+| Median time in a trade | 58 h (~2.5 days) | 46 h (~2 days) |
+| Longest trade | 168 h (time stop) | 168 h (time stop) |
+| Share of time in a trade | 27% | 24% |
+
+So it's a **short-term swing strategy**: we look at the market every hour, but we trade only a few times a month
+and hold for days. Why not more often? Each round trip costs ~0.14%, so frequent small trades would be eaten by
+costs. Why not longer? The spread's relationship isn't stable over months, and funding costs pile up.
+
 ---
 
 ## 9. The backtest (`strategy.backtest`)
@@ -488,7 +615,9 @@ relationship breaks down.
 
 ---
 
-## 14. A complete example trade (real numbers, train period)
+## 14. Going through the trades
+
+### 14a. A complete example trade (real numbers, train period)
 
 | Time (UTC, candle label) | ETH price | BNB price | beta | z | Position |
 |---|---|---|---|---|---|
@@ -510,9 +639,114 @@ What happened:
 Not every trade goes like this. On 2023-03-03 a long trade was entered at z = −2.73, the gap kept widening, and the
 stop loss closed it at z = −4.40 for −4.1%.
 
+### 14b. How the trades ended (train)
+
+| Exit reason | Trades | Avg return per trade | Win rate |
+|---|---|---|---|
+| take profit | 53 | +2.0% | 92% |
+| stop loss | 31 | −1.8% | 0% |
+| time stop | 16 | −0.5% | 50% |
+| end of data | 1 | +0.3% | – |
+
+The pattern of every mean-reversion strategy: about half the trades revert as hoped and make the money. About a
+third go wrong and are cut by the stop loss. The rest are cut by the time stop at about break-even. The average win
+(+2.0%) is only slightly bigger than the average loss (−1.8%), so the 57% win rate is what makes it profitable.
+Long-spread and short-spread trades are balanced: 51 and 50.
+
+### 14c. Best and worst trade (train) — the charts are in notebook section 5
+
+**Best trade: +7.0%** (2 Jan 2024, 28 hours, short spread)
+- z jumped to +3.18: ETH was very expensive compared with BNB.
+- We shorted the spread: short ETH, long BNB.
+- Over the next 28 hours ETH fell 7.4%, BNB only 1.0%. z fell back through 0 → take profit.
+
+**Worst trade: −7.2%** (22 Sep 2025, 84 hours, long spread)
+- z fell to −2.67: ETH cheap compared with BNB. We went long the spread: long ETH, short BNB.
+- The spread recovered only halfway (z about −1.2) and never reached 0.
+- On 25 Sep ETH fell again, z passed −3.5 → stop loss. Over the trade ETH fell 9.0%, BNB 6.2%.
+
+**What both have in common (important):** the rolling beta at entry was very low, 0.10 and 0.16. With beta = 0.1 the
+split is 1/1.1 = **91% in ETH and only 9% in BNB**. Both trades were therefore mostly **bets on ETH's direction**,
+not hedged spread trades. That's why they were the biggest winner and the biggest loser. About 1 in 5 trades is
+entered with beta < 0.5. Those trades are much riskier (std of trade return 3.5% vs 2.0%), though on average they
+happened to make money. A beta filter (e.g. only trade when 0.5 < beta < 2) would make the strategy cleaner. We
+didn't add it, because we would have been choosing it after looking at the results.
+
+### 14d. The test trades (Jan–Oct 2026)
+
+| Exit reason | Trades | Avg return per trade | Win rate |
+|---|---|---|---|
+| take profit | 13 | +1.2% | 85% |
+| stop loss | 9 | −1.3% | 0% |
+| time stop | 4 | −0.1% | 50% |
+
+The story of the test period:
+- **January to early June:** mostly take-profits. The equity rose to about **+9.3% on 1 June**. Best test trade
+  (31 May, short spread): +4.2% in 29 hours.
+- **June to October:** 8 of the last 10 trades were stop losses or time stops, and the equity fell back to +2.6%.
+  The ETH/BNB relationship was less stable in that period.
+- **Worst test trade** (5 Feb): entered at z = +3.48, just below the stop level of 3.5, and stopped out 15 hours
+  later at z = 4.08 for −2.9%.
+- **Stop losses come fast:** all 9 test stop losses came within 15 hours of entry, 5 of them within 3 hours, and
+  mostly from entries just above 2.5. z often jumps by more than 1 within a few hours, so one strong move goes
+  straight through the narrow band between entry (2.5) and stop (3.5).
+- **Two take-profit trades lost money** (1 Apr −0.7%, 8 May −2.7%). How can that happen? The z-score is measured
+  against a *rolling* mean. If the mean moves toward the spread, z returns to 0 although the spread itself
+  hasn't come back. On top of that, the PnL uses the beta frozen at entry, while z uses today's beta.
+
+All 26 test trades are listed in the notebook (section 6).
+
 ---
 
-## 15. Glossary
+## 15. Challenges
+
+1. **No pair is truly cointegrated.** None of 66 pairs survives the multiple-testing correction. The core
+   assumption of pairs trading only holds loosely and for limited periods. Our answer: rolling beta and z-score.
+2. **Fake pairs.** The two "best" pairs contained LTC, which is stationary on its own. We only found that by also
+   testing each coin alone.
+3. **Overfitting.** We tried 162 combinations on train. The chosen one is an isolated peak, not a plateau, and the
+   test Sharpe dropped from 0.82 to 0.33.
+4. **Costs.** A round trip costs ~0.14% of capital. Costs ate a quarter of the gross profit on train and half on
+   test; with double fees the test return is zero.
+5. **Unstable hedge ratio.** The rolling beta ranged from −0.5 to 4.1. When it is near 0, a "pair trade" turns into
+   a directional ETH bet (see 14c).
+6. **The z-score is a moving target.** It can return to 0 because the rolling mean moved, not the spread, so a
+   take-profit can still lose money.
+7. **Narrow band between entry and stop.** With entry at 2.5 and stop at 3.5, fast moves trigger a stop within hours.
+8. **Timing without lookahead.** Candles are labelled by their start time but we trade at their close, and funding
+   is stamped at the moment it is paid. Both had to be aligned carefully, so that a position never earns a move or
+   pays funding from before it was opened.
+9. **Few trades.** One pair gives only 26 test trades, too few to tell a small edge from luck.
+
+---
+
+## 16. What we learned
+
+1. **Correlation is not cointegration.** Coins that move together hour by hour can still drift apart for months.
+2. **Statistical tests need care.** With 66 tests some look significant by luck (multiple testing), and a test can
+   be fooled when one coin is stationary on its own (the LTC pairs).
+3. **Costs decide whether an edge survives.** A strategy that's profitable before costs can be worthless after them.
+   Every assumption (fees, slippage, funding) matters.
+4. **In-sample results are optimistic.** Picking the best of many combinations always looks good on train. Look for
+   plateaus, not peaks, and keep a test period you only use once.
+5. **Risk management is about the losses, not the average.** The stop loss didn't need to raise returns to be
+   useful: it cut the max drawdown from −27% to −16%.
+6. **Check what you are really trading.** A low beta silently turned some pair trades into directional bets.
+   Looking at individual trades, not just summary numbers, revealed this.
+7. **Honesty over a high Sharpe.** Our final result is modest: positive but weak out of sample. We can explain why,
+   and what we would change.
+
+**What we would do next:**
+- trade many pairs as a portfolio (more trades, more diversification, more reliable statistics)
+- re-calibrate regularly on recent data (walk-forward testing)
+- a beta filter or a Kalman-filter hedge ratio
+- a wider band between entry and stop
+- maker orders to cut fees
+- pause trading when the rolling cointegration breaks down
+
+---
+
+## 17. Glossary
 
 | Term | Meaning |
 |---|---|
