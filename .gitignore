@@ -22,4 +22,3 @@ data/*
 .DS_Store
 .vscode/
 .idea/
-results/*.png
